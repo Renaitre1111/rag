@@ -15,7 +15,6 @@ from rdkit import Chem
 logger = logging.getLogger(__name__)
 
 class TrainerConfig:
-    # optimization parameters
     max_epochs = 10
     batch_size = 64
     learning_rate = 3e-4
@@ -27,7 +26,7 @@ class TrainerConfig:
     final_tokens = 260e7
     ckpt_path = None
     run_name = None
-    num_workers = 0 # for DataLoader
+    num_workers = 0
     load_checkpoint_path = None
 
     def __init__(self, **kwargs):
@@ -35,7 +34,6 @@ class TrainerConfig:
             setattr(self, k, v)
 
 class Trainer:
-
     def __init__(self, model, train_dataset, test_dataset, config, stoi=None, itos=None):
         self.model = model
         self.train_dataset = train_dataset
@@ -109,16 +107,39 @@ class Trainer:
 
             losses = []
             pbar = tqdm(enumerate(loader), total=len(loader)) if is_train else enumerate(loader)
-            for it, (input_ids, targets, condition_split_id) in pbar:
-                input_ids = input_ids.to(self.device)
-                targets = targets.to(self.device)
-                condition_split_id = condition_split_id.to(self.device)
 
-                with torch.cuda.amp.autocast():
-                    with torch.set_grad_enabled(is_train):
-                        logits, loss = model(input_ids, targets=targets, condition_split_id=condition_split_id)
-                        loss = loss.mean()
-                        losses.append(loss.item())
+            for it, batch in pbar:
+                
+                # --- 分支逻辑开始 ---
+                if len(batch) == 4:
+                    # Case 1: PoeticMamba (HybridDataset)
+                    # batch: (ref_ids, tgt_ids, ref_prop, tgt_prop)
+                    ref_ids, tgt_ids, ref_prop, tgt_prop = [x.to(self.device) for x in batch]
+                    
+                    # 用于计算 token 数量的 target
+                    target_for_decay = tgt_ids 
+                    
+                    with torch.cuda.amp.autocast():
+                        with torch.set_grad_enabled(is_train):
+                            # 调用 PoeticMamba 的 forward
+                            logits, loss = model(ref_ids, tgt_ids, ref_prop, tgt_prop)
+                            loss = loss.mean()
+                            losses.append(loss.item())
+                            
+                else:
+                    # Case 2: Original Mamba (Mol3DDataset)
+                    # batch: (input_ids, targets, condition_split_id)
+                    input_ids, targets, condition_split_id = [x.to(self.device) for x in batch]
+                    
+                    target_for_decay = targets
+                    
+                    with torch.cuda.amp.autocast():
+                        with torch.set_grad_enabled(is_train):
+                            # 调用原有的 forward
+                            logits, loss = model(input_ids, targets=targets, condition_split_id=condition_split_id)
+                            loss = loss.mean()
+                            losses.append(loss.item())
+                # --- 分支逻辑结束 ---
 
                 if is_train:
                     model.zero_grad()
@@ -129,7 +150,8 @@ class Trainer:
                     scaler.update()
 
                     if config.lr_decay:
-                        self.tokens += (targets >= 0).sum()
+                        # [修改] 使用统一的 target_for_decay 变量
+                        self.tokens += (target_for_decay >= 0).sum()
                         if self.tokens < config.warmup_tokens:
                             # linear warmup
                             lr_mult = float(self.tokens) / float(max(1, config.warmup_tokens))

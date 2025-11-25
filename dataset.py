@@ -4,6 +4,39 @@ import numpy as np
 import re
 import json
 
+class HybridDataset(Dataset):
+    def __init__(self, target_ids, target_props, ref_path, db_ids):
+        super().__init__()
+        self.target_ids = target_ids 
+        self.db_ids = db_ids
+
+        self.target_props = [float(str(p).strip()) for p in target_props]
+        data = np.load(ref_path)
+        self.ref_indices = data['indices']
+        self.ref_props_data = data['properties']
+    
+    def __len__(self):
+        return len(self.target_ids)
+    
+    def __getitem__(self, idx):
+        tgt_ids = self.target_ids[idx]
+        tgt_prop = torch.tensor([self.target_props[idx]], dtype=torch.float)
+
+        ref_idx = self.ref_indices[idx, 0]
+        ref_ids = self.db_ids[ref_idx]
+
+        ref_val = self.ref_props_data[idx, 0]
+        if isinstance(ref_val, np.ndarray):
+            ref_val = ref_val.item()
+        ref_prop = torch.tensor([float(ref_val)], dtype=torch.float)
+
+        return (
+            torch.tensor(ref_ids.astype(np.int64), dtype=torch.long),
+            torch.tensor(tgt_ids.astype(np.int64), dtype=torch.long),
+            ref_prop,
+            tgt_prop
+        )
+
 
 class Mol3DDataset(Dataset):
     def __init__(self, texts, tokenizer, max_len, conditions=None, conditions_split_id=None, prefix_sep=' '):

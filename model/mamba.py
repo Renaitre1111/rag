@@ -155,8 +155,11 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
-    def forward(self, input_ids, inference_params=None):
-        hidden_states = self.embedding(input_ids)
+    def forward(self, input_ids=None, inputs_embeds=None, inference_params=None):
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embedding(input_ids)
         residual = None
         for layer in self.layers:
             new_hidden_states, new_residual = layer(

@@ -6,84 +6,7 @@ import numpy as np
 import os
 import math
 import argparse
-
-class SinusoidalPositionEmbeddings(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-    
-    def forward(self, time):
-        # time: (batch_size, 1)
-        device = time.device
-        half_dim = self.dim // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = time * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
-    
-class PropertyEncoder(nn.Module):
-    def __init__(self, output_dim=128):
-        super().__init__()
-        self.sinusoidal = SinusoidalPositionEmbeddings(64)
-        self.mlp = nn.Sequential(
-            nn.Linear(64, 128),
-            nn.SiLU(),
-            nn.Linear(128, output_dim),
-            nn.SiLU()
-        )
-    
-    def forward(self, x):
-        # x: (batch_size, 1)
-        feat = self.sinusoidal(x)
-        return self.mlp(feat)
-    
-class cVAE(nn.Module):
-    def __init__(self, input_dim=128, cond_dim=128, latent_dim=64):
-        super().__init__()
-        
-        self.prop_encoder = PropertyEncoder(output_dim=cond_dim)
-        
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim + cond_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.SiLU(),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.SiLU()
-        )
-        self.fc_mu = nn.Linear(256, latent_dim)
-        self.fc_var = nn.Linear(256, latent_dim)
-
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim + cond_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.SiLU(),
-            nn.Linear(256, 512),
-            nn.BatchNorm1d(512),
-            nn.SiLU(),
-            nn.Linear(512, input_dim)
-        )
-
-    def reparametorize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-    
-    def forward(self, x, prop):
-        c = self.prop_encoder(prop)
-
-        encoder_input = torch.cat([x, c], dim=1)
-        hidden = self.encoder(encoder_input)
-        mu = self.fc_mu(hidden)
-        logvar = self.fc_var(hidden)
-
-        z = self.reparametorize(mu, logvar)
-        
-        decoder_input = torch.cat([z, c], dim=1)
-        recon_x = self.decoder(decoder_input)
-
-        return recon_x, mu, logvar
+from utils import cVAE
     
 class MoleculeEmbeddingDataset(Dataset):
     def __init__(self, embedding_path, property_path):
@@ -124,7 +47,7 @@ def get_sampler(properties, num_bins=100):
     )
     return sampler
 
-def loss_fuction(recon_x, x, mu, logvar, current_kl_weight):
+def loss_function(recon_x, x, mu, logvar, current_kl_weight):
     MSE = nn.functional.mse_loss(recon_x, x, reduction='sum')
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     loss = MSE + current_kl_weight * KLD
@@ -162,7 +85,7 @@ def main(args):
             
             recon_emb, mu, logvar = model(emb, prop)
             
-            loss, mse, kld = loss_fuction(recon_emb, emb, mu, logvar, current_beta)
+            loss, mse, kld = loss_function(recon_emb, emb, mu, logvar, current_beta)
             
             loss.backward()
             optimizer.step()
