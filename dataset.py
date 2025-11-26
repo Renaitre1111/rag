@@ -3,39 +3,59 @@ from torch.utils.data import Dataset
 import numpy as np
 import re
 import json
+import torch.nn.functional as F
 
-class HybridDataset(Dataset):
-    def __init__(self, target_ids, target_props, ref_path, db_ids):
+class SoftRAGDataset(Dataset):
+    def __init__(self, target_texts, target_props, tokenizer, db_emb_path, db_prop_path, retrieval_path, split='train', max_len=512):
         super().__init__()
-        self.target_ids = target_ids 
-        self.db_ids = db_ids
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.split = split
 
-        self.target_props = [float(str(p).strip()) for p in target_props]
-        data = np.load(ref_path)
-        self.ref_indices = data['indices']
-        self.ref_props_data = data['properties']
+        self.target_texts = target_texts 
+        self.target_props = torch.tensor([float(str(p).strip()) for p in target_props], dtype=torch.float)
+
+        emb_data = np.load(db_emb_path)
+        self.db_embeddings = torch.from_numpy(emb_data['embeddings']).float()
+
+        with open(db_prop_path, 'r') as f:
+            db_props = [float(line.strip().split()[0]) for line in f if line.strip()]
+        self.db_props = torch.tensor(db_props, dtype=torch.float)
+
+        ret_data = np.load(retrieval_path)
+        self.retrieved_indices = torch.from_numpy(ret_data['indices']).long() # [N, K]
+
+        if 'sims' in ret_data:
+            self.retrieved_sims = torch.from_numpy(ret_data['sims']).float()  # [N, K]
+        else:
+            self.retrieved_sims = None
     
     def __len__(self):
-        return len(self.target_ids)
+        return len(self.target_texts)
     
     def __getitem__(self, idx):
-        tgt_ids = self.target_ids[idx]
-        tgt_prop = torch.tensor([self.target_props[idx]], dtype=torch.float)
+        tgt_ids_list = self.tokenizer.encode(self.target_texts[idx])
+        target_input_ids = torch.tensor(tgt_ids_list, dtype=torch.long)
 
-        ref_idx = self.ref_indices[idx, 0]
-        ref_ids = self.db_ids[ref_idx]
+        target_prop = self.target_props[idx].view(1) # [1]
 
-        ref_val = self.ref_props_data[idx, 0]
-        if isinstance(ref_val, np.ndarray):
-            ref_val = ref_val.item()
-        ref_prop = torch.tensor([float(ref_val)], dtype=torch.float)
+        indices = self.retrieved_indices[idx] # [K]
 
-        return (
-            torch.tensor(ref_ids.astype(np.int64), dtype=torch.long),
-            torch.tensor(tgt_ids.astype(np.int64), dtype=torch.long),
-            ref_prop,
-            tgt_prop
-        )
+        if self.split == 'train' and self.retrieved_sims is not None:
+            sims = self.retrieved_sims[idx] # [K]
+            temperature = 0.5 
+            probs = F.softmax(sims / temperature, dim=0)
+            
+            sample_idx = torch.multinomial(probs, 1).item()
+            final_ref_idx = indices[sample_idx]
+        else:
+            final_ref_idx = indices[0]
+
+        ref_egnn_vec = self.db_embeddings[final_ref_idx] # [EGNN_Dim]
+        ref_prop = self.db_props[final_ref_idx].view(1)  # [1]
+
+        return ref_egnn_vec, target_input_ids, ref_prop, target_prop
+
 
 
 class Mol3DDataset(Dataset):

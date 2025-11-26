@@ -109,38 +109,29 @@ class Trainer:
             pbar = tqdm(enumerate(loader), total=len(loader)) if is_train else enumerate(loader)
 
             for it, batch in pbar:
-                
-                # --- 分支逻辑开始 ---
                 if len(batch) == 4:
-                    # Case 1: PoeticMamba (HybridDataset)
-                    # batch: (ref_ids, tgt_ids, ref_prop, tgt_prop)
-                    ref_ids, tgt_ids, ref_prop, tgt_prop = [x.to(self.device) for x in batch]
+                    ref_egnn_vec, target_input_ids, ref_prop, target_prop = [x.to(self.device) for x in batch]
                     
-                    # 用于计算 token 数量的 target
-                    target_for_decay = tgt_ids 
+                    target_for_decay = target_input_ids
                     
                     with torch.cuda.amp.autocast():
                         with torch.set_grad_enabled(is_train):
-                            # 调用 PoeticMamba 的 forward
-                            logits, loss = model(ref_ids, tgt_ids, ref_prop, tgt_prop)
+                            logits, loss = model(ref_egnn_vec, target_input_ids, ref_prop, target_prop)
+                            
                             loss = loss.mean()
                             losses.append(loss.item())
                             
                 else:
-                    # Case 2: Original Mamba (Mol3DDataset)
-                    # batch: (input_ids, targets, condition_split_id)
                     input_ids, targets, condition_split_id = [x.to(self.device) for x in batch]
                     
                     target_for_decay = targets
                     
                     with torch.cuda.amp.autocast():
                         with torch.set_grad_enabled(is_train):
-                            # 调用原有的 forward
                             logits, loss = model(input_ids, targets=targets, condition_split_id=condition_split_id)
                             loss = loss.mean()
                             losses.append(loss.item())
-                # --- 分支逻辑结束 ---
-
+                            
                 if is_train:
                     model.zero_grad()
                     scaler.scale(loss).backward()

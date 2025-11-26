@@ -12,7 +12,7 @@ from torch.cuda.amp import GradScaler
 from trainer import Trainer, TrainerConfig
 from model.mamba import MambaLMHeadModel, MambaConfig
 from model.poetic import PoeticMamba                
-from dataset import Mol3DDataset, SimpleTokenizer, HybridDataset
+from dataset import Mol3DDataset, SimpleTokenizer, SoftRAGDataset # 引入新 Dataset
 import math
 import re
 import torch.distributed as dist
@@ -52,34 +52,25 @@ def run(args, rank=None):
 
     print("making tokenizer")
     max_len = args.max_len
-    print("tokenizer:")
     tokenizer_path = args.tokenizer_dir
     if not os.path.isdir(tokenizer_path):
         os.makedirs(tokenizer_path)
     tokenizer_path = args.tokenizer_dir + "/vocab.json"
-    print(tokenizer_path)
+
     if os.path.exists(tokenizer_path):
         print(f"The file '{tokenizer_path}' exists.")
         tokenizer = load_tokenizer(tokenizer_path, max_len)
     else:
         tokenizer = SimpleTokenizer(max_length=max_len)
-        if args.pre_root_path is not None:
-            tokenizer.fit_on_file(args.pre_root_path + '.txt')
-        tokenizer.fit_on_file(args.root_path + '.txt')
-        if args.conditions_path is not None:
-            tokenizer.fit_on_file(args.conditions_path)
+        tokenizer.fit_on_file(args.root_path)
         tokenizer.save_vocab(tokenizer_path)
         print("tokenizer saved")
 
     vocab_size = tokenizer.get_vocab_size()
 
     print("making dataset")
-    ids_path = args.root_path + '_ids.npy'
-
-    if os.path.exists(ids_path):
-        print(f"Loading pre-tokenized data from {ids_path}...")
-        train_ids = np.load(ids_path)
-        db_ids = train_ids
+    with open(args.root_path, 'r') as f:
+        train_texts = [line.strip() for line in f.readlines() if line.strip()]
     
     with open(args.prop_path, 'r') as f:
         train_props = f.readlines()
@@ -90,7 +81,18 @@ def run(args, rank=None):
         load_checkpoint_path = None
     
     if args.model == 'poetic':
-        train_dataset = HybridDataset(train_ids, train_props, args.ref_path, db_ids)
+        train_dataset = SoftRAGDataset(
+            target_texts=train_texts,
+            target_props=train_props,
+            tokenizer=tokenizer,
+            db_emb_path=args.db_emb_path,     
+            db_prop_path=args.db_prop_path,    
+            retrieval_path=args.retrieval_path,
+            split='train',
+            max_len=max_len
+        )
+    else:
+        train_dataset = Mol3DDataset(train_texts, tokenizer, max_len)
 
     print(f"train dataset size: {len(train_dataset)}")
 
@@ -105,7 +107,8 @@ def run(args, rank=None):
         from model.poetic import PoeticMamba
         mamba_config = MambaConfig(d_model=args.n_embd, n_layer=args.n_layer, vocab_size=vocab_size,
                                    auto_fp16to32=args.auto_fp16to32)
-        model = PoeticMamba(mamba_config, device=device)
+        
+        model = PoeticMamba(mamba_config, egnn_dim=args.egnn_dim, device=device)
 
     if args.pre_model_path is not None:
         print("loading pretrained model: ", args.pre_model_path)
@@ -125,13 +128,25 @@ def run(args, rank=None):
     print('total params:', sum(p.numel() for p in model.parameters()))
     os.makedirs(f'cond/{args.prop}_weights/', exist_ok=True)
     
-    tconf = TrainerConfig(max_epochs=args.max_epochs, batch_size=args.batch_size, learning_rate=args.learning_rate,
-                          lr_decay=True, warmup_tokens=0.1 * len(train_dataset) * max_len,
-                          final_tokens=args.max_epochs * len(train_dataset) * max_len,
-                          num_workers=args.num_workers, ckpt_path=f'cond/{args.prop}_weights/{args.run_name}.pt',
-                          run_name=args.run_name, block_size=max_len, generate=False, save_start_epoch=args.save_start_epoch,
-                          grad_norm_clip=args.grad_norm_clip, load_checkpoint_path=load_checkpoint_path,
-                          save_interval_epoch=args.save_interval_epoch, dist=args.dist, rank=rank)
+    tconf = TrainerConfig(
+        max_epochs=args.max_epochs, 
+        batch_size=args.batch_size, 
+        learning_rate=args.learning_rate,
+        lr_decay=True, 
+        warmup_tokens=0.1 * len(train_dataset) * max_len,
+        final_tokens=args.max_epochs * len(train_dataset) * max_len,
+        num_workers=args.num_workers, 
+        ckpt_path=f'cond/{args.prop}_weights/{args.run_name}.pt',
+        run_name=args.run_name, 
+        block_size=max_len, 
+        generate=False, 
+        save_start_epoch=args.save_start_epoch,
+        grad_norm_clip=args.grad_norm_clip, 
+        load_checkpoint_path=load_checkpoint_path,
+        save_interval_epoch=args.save_interval_epoch, 
+        dist=args.dist, 
+        rank=rank
+    )
                           
     trainer = Trainer(model, train_dataset, None, tconf)
     df = trainer.train(wandb)
@@ -146,7 +161,6 @@ if __name__ == '__main__':
     parser.add_argument('--scaffold', action='store_true', default=False, help='condition on scaffold')
     parser.add_argument('--lstm', action='store_true', default=False, help='use lstm for transforming scaffold')
     parser.add_argument('--prop', type=str, default='alpha', help="propertie to be used for condition", required=False)
-    parser.add_argument('--num_props', type=int, default = 1, help="number of properties to use for condition", required=False)
     parser.add_argument('--model', type=str, default='poetic', help="name of the model", required=False)
     parser.add_argument('--tokenizer', type=str, default='simple', help="name of the tokenizer", required=False)
     parser.add_argument('--n_layer', type=int, default=16, help="number of layers", required=False)
@@ -167,14 +181,14 @@ if __name__ == '__main__':
     parser.add_argument('--pre_root_path', default=None, help="Path to the pretrain data directory", required=False)
     parser.add_argument('--pre_model_path', default=None, help="Path to the pretrain model", required=False)
     parser.add_argument('--root_path', help="Path to the root data directory", required=True)
+    parser.add_argument('--prop_path', help="Path to target properties (.txt)", required=True)
     parser.add_argument('--tokenizer_dir', help="Path to the saved tokenizer directory", required=True)
-    parser.add_argument('--conditions_path', default=None, help="Path to the generation condition", required=False)
-    parser.add_argument('--conditions_split_id_path', default=None, help="Path to the conditions_split_id", required=False)
     parser.add_argument('--dist', action='store_true', default=False, help='use torch.distributed')
 
-    parser.add_argument('--db_path', help="Path to database 3D seqs txt (source for retrieving refs)", required=False)
-    parser.add_argument('--prop_path', help="Path to target properties file (train)", required=False)
-    parser.add_argument('--ref_path', help="Path to reference indices .npz file (train)", required=False)
+    parser.add_argument('--db_emb_path', help="Path to DB EGNN embeddings (.npz)", required=True)
+    parser.add_argument('--db_prop_path', help="Path to DB properties (.txt/npy)", required=True)
+    parser.add_argument('--retrieval_path', help="Path to retrieval indices & sims (.npz)", required=True)
+    parser.add_argument('--egnn_dim', type=int, default=128, help="Dimension of EGNN embeddings")
 
     args = parser.parse_args()
 
