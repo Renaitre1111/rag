@@ -247,7 +247,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
-    def forward(self, input_ids, targets=None, condition_split_id=None, prop=None, scaffold=None, position_ids=None, inference_params=None,
+    def forward(self, input_ids=None, inputs_embeds=None, targets=None, condition_split_id=None, prop=None, scaffold=None, position_ids=None, inference_params=None,
                 num_last_tokens=0):
         """
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
@@ -257,32 +257,39 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
-        b, t = input_ids.size()
-        hidden_states = self.backbone(input_ids, inference_params=inference_params)
+        if inputs_embeds is not None:
+            hidden_states = self.backbone(inputs_embeds=inputs_embeds, inference_params=inference_params)
+            b, t, _ = inputs_embeds.size()
+        else:
+            hidden_states = self.backbone(input_ids, inference_params=inference_params)
+            b, t = input_ids.size()
+        
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
-        lm_logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states)
 
-        if self.config.num_props and self.config.scaffold:
-            num = int(bool(self.config.num_props)) + int(self.config.scaffold_maxlen)
-        elif self.config.num_props:
-            num = int(bool(self.config.num_props))
-        elif self.config.scaffold:
-            num = int(self.config.scaffold_maxlen)
-        else:
-            num = 0
 
-        logits = lm_logits
         loss = None
         if targets is not None:
             mask = targets != self.padding_token_id
+
+            if self.config.num_props and self.config.scaffold:
+                num = int(bool(self.config.num_props)) + int(self.config.scaffold_maxlen)
+            elif self.config.num_props:
+                num = int(bool(self.config.num_props))
+            elif self.config.scaffold:
+                num = int(self.config.scaffold_maxlen)
+            else:
+                num = 0
+
             if num > 0:
                 mask[:, :num] = False
-            if self.isconditional:
+            if self.isconditional and condition_split_id is not None:
                 range_tensor = torch.arange(t, device=mask.device).expand(b, -1)
                 expanded_split_id = condition_split_id.unsqueeze(1).expand(-1, t)
                 cond_mask = range_tensor < expanded_split_id
                 mask[cond_mask] = False
+
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), reduction='none')
             loss = (loss * mask.reshape(-1)).sum() / mask.sum()
 
