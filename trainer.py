@@ -131,7 +131,7 @@ class Trainer:
                             logits, loss = model(input_ids, targets=targets, condition_split_id=condition_split_id)
                             loss = loss.mean()
                             losses.append(loss.item())
-                            
+                
                 if is_train:
                     model.zero_grad()
                     scaler.scale(loss).backward()
@@ -141,7 +141,6 @@ class Trainer:
                     scaler.update()
 
                     if config.lr_decay:
-                        # [修改] 使用统一的 target_for_decay 变量
                         self.tokens += (target_for_decay >= 0).sum()
                         if self.tokens < config.warmup_tokens:
                             # linear warmup
