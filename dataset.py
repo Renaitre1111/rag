@@ -6,21 +6,32 @@ import json
 import torch.nn.functional as F
 
 class SoftRAGDataset(Dataset):
-    def __init__(self, target_texts, target_props, tokenizer, db_emb_path, db_prop_path, retrieval_path, split='train', max_len=512):
+    def __init__(self, target_texts, target_props, tokenizer, db_emb_path, db_prop_path, retrieval_path, split='train', max_len=512, mean=None, std=None):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.split = split
 
         self.target_texts = target_texts 
-        self.target_props = torch.tensor([float(str(p).strip()) for p in target_props], dtype=torch.float)
+
+        raw_target_props = torch.tensor([float(str(p).strip()) for p in target_props], dtype=torch.float)
 
         emb_data = np.load(db_emb_path)
         self.db_embeddings = torch.from_numpy(emb_data['embeddings']).float()
 
         with open(db_prop_path, 'r') as f:
-            db_props = [float(line.strip().split()[0]) for line in f if line.strip()]
-        self.db_props = torch.tensor(db_props, dtype=torch.float)
+            raw_db_props = [float(line.strip().split()[0]) for line in f if line.strip()]
+        raw_db_props = torch.tensor(raw_db_props, dtype=torch.float)
+
+        if mean is None or std is None:
+            self.mean = torch.mean(raw_db_props)
+            self.std = torch.std(raw_db_props)
+        else:
+            self.mean = mean
+            self.std = std
+
+        self.target_props = (raw_target_props - self.mean) / self.std
+        self.db_props = (raw_db_props - self.mean) / self.std
 
         ret_data = np.load(retrieval_path)
         self.retrieved_indices = torch.from_numpy(ret_data['indices']).long() # [N, K]
