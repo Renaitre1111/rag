@@ -12,7 +12,7 @@ from torch.cuda.amp import GradScaler
 from trainer import Trainer, TrainerConfig
 from model.mamba import MambaLMHeadModel, MambaConfig
 from model.poetic import PoeticMamba                
-from dataset import Mol3DDataset, SimpleTokenizer, SoftRAGDataset # 引入新 Dataset
+from dataset import Mol3DDataset, SimpleTokenizer, SoftRAGDataset
 import math
 import re
 import torch.distributed as dist
@@ -57,14 +57,11 @@ def run(args, rank=None):
         os.makedirs(tokenizer_path)
     tokenizer_path = args.tokenizer_dir + "/vocab.json"
 
-    if os.path.exists(tokenizer_path):
-        print(f"The file '{tokenizer_path}' exists.")
-        tokenizer = load_tokenizer(tokenizer_path, max_len)
-    else:
-        tokenizer = SimpleTokenizer(max_length=max_len)
-        tokenizer.fit_on_file(args.root_path)
+    tokenizer = SimpleTokenizer(max_length=max_len)
+    tokenizer.fit_on_file(args.root_path)
+    if rank is None or rank == 0:
         tokenizer.save_vocab(tokenizer_path)
-        print("tokenizer saved")
+        print(f"tokenizer saved to {tokenizer_path}")
 
     vocab_size = tokenizer.get_vocab_size()
 
