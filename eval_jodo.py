@@ -7,7 +7,6 @@ import argparse
 import torch
 import numpy as np
 from tqdm import tqdm
-# 保留 import 防止内部依赖报错，但主逻辑中我们不使用它
 from eval_follow_edm.datasets_config import get_dataset_info
 from eval_follow_jodo.stability import get_edm_metric, get_2D_edm_metric
 from eval_follow_jodo.mose_metric import get_moses_metrics
@@ -17,7 +16,6 @@ import logging
 from rdkit.Chem import rdDetermineBonds, rdmolops
 from eval_follow_edm import rdkit_functions
 
-# Alchemy 原子映射
 dict_alchemy = {0: 'H', 1: 'C', 2: 'N', 3: 'O', 4: 'F', 
                 5: 'P', 6: 'S', 7: 'Cl', 8: 'Br', 9: 'I'}
 
@@ -111,8 +109,6 @@ def spherical_seq_for_eval(dataset_name='alchemy',
     return None, mol_for_jodo_eval_rdkit_e
 
 def eval(data, dataset_info, train_smiles_ref, test_smiles_ref=None):
-    # 1. 计算 Stability 和 Validity
-    # 注意：这里会使用 dataset_info 中的 bond1_radius
     metric_fn = get_edm_metric(dataset_info, train_smiles_ref) 
     
     try:
@@ -156,9 +152,6 @@ if __name__ == '__main__':
     parser.add_argument('--ref_smiles_path', type=str, default="alchemy_train_gen_smiles.npy", help="Path to reference smiles")
     args = parser.parse_args()
 
-    # =========================================================================
-    # 强制修复：直接定义字典，彻底绕过 datasets_config.py
-    # =========================================================================
     dataset_info = {
         'name': 'alchemy',
         'atom_encoder': {'H': 0, 'C': 1, 'N': 2, 'O': 3, 'F': 4, 'P': 5, 'S': 6, 'Cl': 7, 'Br': 8, 'I': 9},
@@ -166,7 +159,6 @@ if __name__ == '__main__':
         'atom_types': {0: 1, 1: 4, 2: 3, 3: 2, 4: 1, 5: 5, 6: 6, 7: 1, 8: 1, 9: 1}, 
         'max_n_nodes': 40,
         'with_h': True,
-        # 这些就是 check_stability 需要的数据
         'bond1_radius': {'H': 31, 'C': 76, 'N': 71, 'O': 66, 'F': 57, 'P': 107, 'S': 105, 'Cl': 102, 'Br': 120, 'I': 139},
         'bond1_stdv': {'H': 5, 'C': 2, 'N': 2, 'O': 2, 'F': 3, 'P': 3, 'S': 3, 'Cl': 3, 'Br': 3, 'I': 3},
         'bond2_radius': {'H': -1000, 'C': 67, 'N': 60, 'O': 57, 'F': 59, 'P': 96, 'S': 94, 'Cl': 90, 'Br': 110, 'I': 130},
@@ -198,7 +190,6 @@ if __name__ == '__main__':
         exit()
 
     if processed_mols_e_rdkit is not None and len(processed_mols_e_rdkit) > 0:
-        # 直接传递我们定义好的字典
         eval(processed_mols_e_rdkit, dataset_info, train_smiles_ref=ref_smiles_list, test_smiles_ref=ref_smiles_list)
     else:
         print("[Error] No valid molecules parsed from input file.")

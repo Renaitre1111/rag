@@ -1,267 +1,106 @@
 import os
-import re
-import math
-import json
-import copy
 import random
-from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Optional
-
+import math
+import copy
+import argparse
+import pickle
+import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
-from torch.nn.utils.rnn import pad_sequence
-import numpy as np
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-import pickle
-from dataset import SimpleTokenizer
+from rdkit import Chem
+from rdkit import RDLogger
+RDLogger.DisableLog('rdApp.*')
+
+from dataset import SimpleTokenizer, SoftRAGDataset
+from model.poetic import PoeticMamba
+from model.mamba import MambaConfig
 from qm9.property_prediction.models_property import EGNN, Naive, NumNodes
 from qm9.property_prediction.prop_utils import get_adj_matrix
 
-MIN_D_VALUE = 0.000
-MAX_D_VALUE = 25.000
-
 ALCHEMY_ATOM_MAP = {
-    'H': 0,
-    'C': 1, 
-    'N': 2, 
-    'O': 3, 
-    'F': 4, 
-    'P': 5,
-    'S': 6, 
-    'Cl': 7, 
-    'Br': 8, 
-    'I': 9, 
+    'H': 0, 'C': 1, 'N': 2, 'O': 3, 'F': 4, 
+    'P': 5, 'S': 6, 'Cl': 7, 'Br': 8, 'I': 9, 
 }
 NUM_ATOM_TYPES = 10
+INV_ATOM_MAP = {v: k for k, v in ALCHEMY_ATOM_MAP.items()}
 
-def _extract_value(line: str) -> str:
-    s = line.strip()
-    if not s:
-        raise ValueError("empty condition line")
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    m = re.match(r'^([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)', s)
-    if m:
-        return m.group(1)
+def validate(line: str):
+    try:
+        toks = line.split()
+        if len(toks) % 4 != 0 or len(toks) == 0:
+            return None, False
 
-    m = re.search(r'\[COND_START\]\s*(\d+\.\d+)\s*\[COND_END\]', s)
-    if m:
-        return m.group(1)
+        mol_data = np.array(toks).reshape(-1, 4)
+        symbols = mol_data[:, 0]
 
-    m = re.search(r'value\s+([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)', s)
-    if m:
-        return m.group(1)
+        for s in symbols:
+            if s not in ALCHEMY_ATOM_MAP: return None, False
 
-    m = re.search(r'=\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)', s)
-    if m:
-        return m.group(1)
+        d = mol_data[:, 1].astype(float)
+        theta = np.array([float(x.replace('°', '')) for x in mol_data[:, 2]])
+        phi = np.array([float(x.replace('°', '')) for x in mol_data[:, 3]])
 
-    m = re.search(r'\b([+-]?\d+)\b', s)
-    if m:
-        return m.group(1)
+        xyz = np.stack((
+            d * np.sin(theta) * np.cos(phi), 
+            d * np.sin(theta) * np.sin(phi), 
+            d * np.cos(theta)
+        ), axis=1)
 
-    nums = re.findall(r'([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)', s)
-    if nums:
-        return nums[-1]
-
-    raise ValueError(f"no numeric value found in condition line: {s!r}")
-
-@torch.no_grad()
-def generate_autoregressive(model: torch.nn.Module,
-                            input_ids: torch.Tensor,
-                            max_len: int,
-                            temp: float = 1.0,
-                            top_k: int = 50,
-                            eos_id: int = None,
-                            pad_id: int = None,
-                            *,
-                            tokenizer=None):
-    if tokenizer is None:
-        raise ValueError("tokenizer is required for distance filtering generation.")
-
-    model.eval()
-    device = input_ids.device
-    B = input_ids.size(0)
-    finished = torch.zeros(B, dtype=torch.bool, device=device)
-
-    expected_token_type = torch.zeros(B, dtype=torch.long, device=device)
-
-    current_len = input_ids.size(1)
-    valid_mask = None
-
-    for _ in range(max_len - current_len):
-        outputs = model(input_ids)
-        logits = outputs[0][:, -1, :]  # [B, V]，
-        if (valid_mask is None) or (valid_mask.size(0) != logits.size(-1)):
-            V = logits.size(-1)
-            mask = torch.zeros(V, dtype=torch.bool, device=logits.device)
-            for tok_str, tok_id in tokenizer.get_vocab().items():  # str->id
-                if 0 <= tok_id < V:
-                    ok = False
-                    try:
-                        val = float(tok_str)
-                        ok = (MIN_D_VALUE <= val <= MAX_D_VALUE)
-                    except Exception:
-                        pass
-                    mask[tok_id] = ok
-            valid_mask = mask
-            tokenizer._valid_dis_mask = mask.detach().cpu()
-        else:
-            valid_mask = tokenizer._valid_dis_mask.to(logits.device)
-
-        if eos_id is not None and pad_id is not None:
-            logits = torch.where(
-                finished.unsqueeze(1),
-                torch.full_like(logits, float("-inf")),
-                logits
-            )
-            logits[finished, pad_id] = 0.0
-
-        need_dist = (expected_token_type == 1) & (~finished)
-        if need_dist.any():
-            rows = need_dist.nonzero(as_tuple=False).squeeze(1)
-            valid_ids = torch.nonzero(valid_mask, as_tuple=False).squeeze(1)  # [K]
-            sub = logits[rows][:, valid_ids]                                 # [R, K]
-            t_d = 0.7            
-            k_d = 80    
-            sub = sub / max(1e-6, t_d)
-            if 0 < k_d < sub.size(-1):
-                vals,_ = torch.topk(sub, k_d); kth = vals[..., -1, None]
-                sub = torch.where(sub < kth, torch.full_like(sub, float('-inf')), sub)
+        mol = Chem.RWMol()
+        conf = Chem.Conformer()
         
-            p = F.softmax(sub, dim=-1)
-            idx = torch.multinomial(p, 1).squeeze(1)      
-            chosen = valid_ids[idx]                        
+        for i, sym in enumerate(symbols):
+            atom = Chem.Atom(sym)
+            idx = mol.AddAtom(atom)
+            conf.SetAtomPosition(idx, (float(xyz[i, 0]), float(xyz[i, 1]), float(xyz[i, 2])))
+        
+        mol.AddConformer(conf)
 
-            logits[rows, :] = float('-inf')
-            logits[rows, chosen] = 0.0
+        try:
+            if hasattr(Chem, 'rdDetermineBonds'):
+                Chem.rdDetermineBonds.DetermineConnectivity(mol)
+                Chem.rdDetermineBonds.DetermineBondOrders(mol)
+            else:
+                pass
+            
+            Chem.SanitizeMol(mol)
+            smi = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False)
+            if len(smi) == 0: return None, False
+            return smi, True
+            
+        except:
+            return None, False
 
-        if temp is not None and temp > 0:
-            logits = logits / max(1e-6, temp)
+    except Exception:
+        return None, False
+    
+def get_stats(prop_path):
+    print(f"Loading properties from {prop_path} to compute stats...")
+    with open(prop_path, 'r') as f:
+        vals = [float(line.strip().split()[0]) for line in f.readlines() if line.strip()]
+    
+    vals = torch.tensor(vals, dtype=torch.float32)
+    mean = torch.mean(vals)
+    mad = torch.mean(torch.abs(vals - mean))
+    
+    print(f"Computed Stats -> Mean: {mean.item():.4f}, MAD: {mad.item():.4f}")
+    return mean.item(), mad.item()
 
-        if top_k is not None and top_k > 0 and top_k < logits.size(-1):
-            values, _ = torch.topk(logits, top_k)
-            min_values = values[..., -1, None]
-            logits = torch.where(logits < min_values, torch.full_like(logits, float("-inf")), logits)
-
-        probs = F.softmax(logits, dim=-1)
-
-        if torch.isnan(probs).any() or (probs.sum(dim=-1) == 0).any():
-            next_token = torch.full((B, 1), pad_id if pad_id is not None else 0, dtype=torch.long, device=device)
-        else:
-            next_token = torch.multinomial(probs, 1)  # [B, 1]
-
-        if eos_id is not None and pad_id is not None:
-            next_token = torch.where(
-                finished.unsqueeze(1),
-                torch.full_like(next_token, pad_id),
-                next_token,
-            )
-
-        input_ids = torch.cat([input_ids, next_token], dim=1)
-
-        if eos_id is not None:
-            finished = finished | (next_token.squeeze(1) == eos_id)
-            if finished.all():
-                break
-
-        expected_token_type = torch.where(finished, expected_token_type, (expected_token_type + 1) % 4)
-
-    return input_ids
-
-def _strip_module_prefix(state):
-    if any(k.startswith("module.") for k in state.keys()):
-        return {k[len("module."):]: v for k, v in state.items()}
-    return state
-
-def _infer_has_per_layer_norm(state):
-    pat = re.compile(r"^backbone\.layers\.(\d+)\.norm\.weight$")
-    return any(pat.match(k) is not None for k in state.keys())
-
-def _infer_n_layers_from_state(state):
-    layer_ids = []
-    for k in state.keys():
-        m = re.match(r"^backbone\.layers\.(\d+)\.", k)
-        if m:
-            layer_ids.append(int(m.group(1)))
-    return (max(layer_ids) + 1) if layer_ids else None
-
-def _maybe_remap_block_name_keys(state, model_keys):
-    has_mixer_in_ckpt = any(".mixer." in k for k in state.keys())
-    has_mamba_in_ckpt = any(".mamba." in k for k in state.keys())
-    has_mixer_in_model = any(".mixer." in k for k in model_keys)
-    has_mamba_in_model = any(".mamba." in k for k in model_keys)
-
-    remapped = state
-    if has_mixer_in_ckpt and not has_mixer_in_model and has_mamba_in_model:
-        remapped = {k.replace(".mixer.", ".mamba."): v for k, v in state.items()}
-    elif has_mamba_in_ckpt and not has_mamba_in_model and has_mixer_in_model:
-        remapped = {k.replace(".mamba.", ".mixer."): v for k, v in state.items()}
-    return remapped
-
-def set_seed(seed, rank=0):
-    random.seed(seed + rank)
-    np.random.seed(seed + rank)
-    torch.manual_seed(seed + rank)
-    torch.cuda.manual_seed_all(seed + rank)
-
-def load_tokenizer(tokenizer_path: str, max_length: int, tokenizer_type: str = "simple"):
-    """Loads tokenizer from vocab file."""
-    tok = SimpleTokenizer(max_length)
-    tok.load_vocab(tokenizer_path)
-    return tok
-
-def build_mask_after_prefix(seqs, prefix_lens, pad_id):
-    B, T = seqs.shape
-    mask = torch.zeros((B, T - 1), dtype=torch.bool, device=seqs.device)
-    tgt = seqs[:, 1:]  # targets for the model's prediction
-    not_pad = (tgt != pad_id)  # True for non-padding tokens
-
-    for i in range(B):
-        eff_len = int((seqs[i] != pad_id).sum().item())
-        start_idx = max(prefix_lens[i] - 1, 0)
-
-        if start_idx >= (eff_len - 1):
-            continue
-
-        row = torch.zeros(T - 1, dtype=torch.bool, device=seqs.device)
-        row[start_idx: eff_len - 1] = True
-        mask[i] = (row & not_pad[i])
-
-    return mask  # [B, T-1]
-
-os.environ['GRPO_STEP'] = '0'
-
-def token_logprobs(model, seqs):
-    """teacher-forcing per-token logprob for targets = seqs[:,1:]"""
-    with torch.cuda.amp.autocast(enabled=True):
-        logits = model(seqs[:, :-1])[0]  # [B, T-1, V]
-
-    if torch.isnan(logits).any():
-        rank = os.environ.get("LOCAL_RANK", "N/A")
-        print(f"[{rank}] WARNING: NaN detected in Mamba model's logits! Step: {os.environ.get('GRPO_STEP', 'N/A')}, Shape: {logits.shape}, Seq_shape: {seqs.shape}")
-
-    logp = F.log_softmax(logits, dim=-1)
-
-    if torch.isnan(logp).any():
-        rank = os.environ.get("LOCAL_RANK", "N/A")
-        print(f"[{rank}] WARNING: NaN detected in log_softmax output (logp)! Step: {os.environ.get('GRPO_STEP', 'N/A')}, Shape: {logp.shape}")
-
-    tgt = seqs[:, 1:]  # [B, T-1]
-    lp = torch.gather(logp, -1, tgt.unsqueeze(-1)).squeeze(-1)
-
-    if torch.isnan(lp).any():
-        rank = os.environ.get("LOCAL_RANK", "N/A")
-        print(f"[{rank}] WARNING: NaN detected in gathered logprobs (lp)! Step: {os.environ.get('GRPO_STEP', 'N/A')}, Shape: {lp.shape}")
-
-    return lp
-
-class RewardEvaluator:
-    def __init__(self, reward_model_type, classifiers_path, prop_name, device, 
-                 train_mean, train_mad, max_num_atoms=40):
+class RewardModel:
+    def __init__(self, classifier_path, device, train_mean, train_mad, max_num_atoms=40):
         self.device = device
         self.maxN = max_num_atoms
         self.elem2idx = ALCHEMY_ATOM_MAP
@@ -269,468 +108,474 @@ class RewardEvaluator:
         self.mean = torch.tensor(train_mean, device=device)
         self.mad = torch.tensor(train_mad, device=device)
         
-        self.classifier = self._load_alchemy_classifier(classifiers_path, reward_model_type, device)
+        self.classifier = self._load_alchemy_classifier(classifier_path, device)
         self.classifier.eval()
 
-    def _load_alchemy_classifier(self, dir_path, model_type, device):
+    def _load_alchemy_classifier(self, dir_path, device):
         args_path = os.path.join(dir_path, 'args.pickle')
+        if not os.path.exists(args_path):
+            raise FileNotFoundError(f"Classifier args not found at {args_path}")
+            
         with open(args_path, 'rb') as f:
             args_classifier = pickle.load(f)
+            
+        args_classifier.device = device
+        print(f"Loading classifier config from {dir_path}...")
         
-        print(f"Loading classifier from {dir_path}...")
-        if model_type == 'egnn':
+        if args_classifier.model_name == 'egnn':
             classifier = EGNN(in_node_nf=NUM_ATOM_TYPES, in_edge_nf=0, 
                               hidden_nf=args_classifier.nf, device=device, 
                               n_layers=args_classifier.n_layers, coords_weight=1.0,
                               attention=args_classifier.attention, node_attr=args_classifier.node_attr)
+        elif args_classifier.model_name == 'naive':
+            classifier = Naive(device=device)
+        elif args_classifier.model_name == 'numnodes':
+            classifier = NumNodes(device=device)
         else:
-            raise ValueError(f"Unsupported model type for Alchemy: {model_type}")
+            raise ValueError(f"Unknown model: {args_classifier.model_name}")
 
         ckpt_path = os.path.join(dir_path, 'best_checkpoint.pth')
         if not os.path.exists(ckpt_path):
             ckpt_path = os.path.join(dir_path, 'best_checkpoint.npy')
-            
-        state_dict = torch.load(ckpt_path, map_location=device)
-        classifier.load_state_dict(state_dict)
+        
+        print(f"Loading weights from {ckpt_path}")
+        classifier_state_dict = torch.load(ckpt_path, map_location=device)
+        classifier.load_state_dict(classifier_state_dict)
+        
         return classifier.to(device)
-
-    def _parse_one(self, line: str):
+    
+    def _parse_mol(self, line: str):
         try:
-            line = line.replace('°', '')
-            
             toks = np.array(line.split(), dtype=object)
-            mol = toks[1:] 
-
-            if len(mol) % 4 != 0:
-                 valid_len = (len(mol) // 4) * 4
-                 mol = mol[:valid_len]
+            if len(toks) % 4 != 0 or len(toks) == 0: return None
+            mol = toks.reshape(-1, 4)
             
-            if len(mol) == 0: return None
-            
-            mol = mol.reshape(-1, 4)
-
             seq = mol[:, 0]
-            try:
-                idxs = [self.elem2idx[str(s)] for s in seq]
-            except KeyError:
-                return None
-            
-            # One-hot: num_classes=10
+            idxs = [self.elem2idx[str(s)] for s in seq]
             one_hot = torch.nn.functional.one_hot(torch.tensor(idxs), num_classes=NUM_ATOM_TYPES).float()
-
-            try:
-                d = mol[:, 1].astype(float)
-                theta = mol[:, 2].astype(float)
-                phi = mol[:, 3].astype(float)
-                
-                xyz = np.stack((d * np.sin(theta) * np.cos(phi), 
-                                d * np.sin(theta) * np.sin(phi), 
-                                d * np.cos(theta)), axis=1).astype(np.float32)
-            except Exception:
-                return None
-
-            if one_hot.shape[0] > self.maxN:
-                return None
-
+            
+            d = mol[:, 1].astype(float)
+            theta = [str(x).replace('°','') for x in mol[:, 2]]
+            theta = np.array(theta).astype(float)
+            phi = [str(x).replace('°','') for x in mol[:, 3]]
+            phi = np.array(phi).astype(float)
+            
+            xyz = np.stack((d * np.sin(theta) * np.cos(phi), 
+                            d * np.sin(theta) * np.sin(phi), 
+                            d * np.cos(theta)), axis=1).astype(np.float32)
+            
             N = one_hot.shape[0]
-            oh = torch.zeros((self.maxN, NUM_ATOM_TYPES), dtype=torch.float32)
-            pos = torch.zeros((self.maxN, 3), dtype=torch.float32)
-            msk = torch.zeros((self.maxN,), dtype=torch.float32)
+            if N > self.maxN: return None
 
-            oh[:N] = one_hot; pos[:N] = torch.from_numpy(xyz); msk[:N] = 1.0
-            return oh, pos, msk
-        except Exception:
+            oh_out = torch.zeros((self.maxN, NUM_ATOM_TYPES), dtype=torch.float32)
+            pos_out = torch.zeros((self.maxN, 3), dtype=torch.float32)
+            msk_out = torch.zeros((self.maxN,), dtype=torch.float32)
+
+            oh_out[:N] = one_hot
+            pos_out[:N] = torch.from_numpy(xyz)
+            msk_out[:N] = 1.0
+            return oh_out, pos_out, msk_out
+        except:
             return None
-
+    
     @torch.no_grad()
-    def predict(self, lines: List[str]):
-        B = len(lines)
-        parsed = [self._parse_one(ln) for ln in lines]
-        valid = torch.tensor([0 if p is None else 1 for p in parsed], dtype=torch.bool, device=self.device)
+    def predict_batch(self, lines):
+        parsed = [self._parse_mol(ln) for ln in lines]
+        valid_mask = torch.tensor([1 if p is not None else 0 for p in parsed], dtype=torch.bool, device=self.device)
+        
+        if valid_mask.sum() == 0:
+            return torch.zeros(len(lines), device=self.device), valid_mask
 
-        if valid.sum() == 0:
-            return torch.full((B,), float('nan'), device=self.device), valid
-
-        # Stack valid parsed data
-        oh = torch.stack([p[0] if p is not None else torch.zeros(self.maxN, NUM_ATOM_TYPES) for p in parsed]).to(self.device)
-        pos = torch.stack([p[1] if p is not None else torch.zeros(self.maxN, 3) for p in parsed]).to(self.device)
-        am = torch.stack([p[2] if p is not None else torch.zeros(self.maxN) for p in parsed]).to(self.device)
+        valid_indices = torch.nonzero(valid_mask).squeeze()
+        if valid_indices.dim() == 0: valid_indices = valid_indices.unsqueeze(0)
+        
+        oh = torch.stack([parsed[i][0] for i in valid_indices]).to(self.device)
+        pos = torch.stack([parsed[i][1] for i in valid_indices]).to(self.device)
+        am = torch.stack([parsed[i][2] for i in valid_indices]).to(self.device)
 
         BN, N = am.shape
-
-        # Construct edge mask
         edge_mask = (am.unsqueeze(1) * am.unsqueeze(2)).bool()
         diag = ~torch.eye(N, dtype=torch.bool, device=self.device).unsqueeze(0)
         edge_mask = (edge_mask & diag).view(BN * N * N, 1).float()
-
+        
         nodes = oh.view(BN * N, -1)
         edges = get_adj_matrix(N, BN, self.device)
-
-        with torch.cuda.amp.autocast(enabled=True):
+        
+        with autocast(enabled=True):
             pred = self.classifier(h0=nodes, x=pos.view(BN * N, -1), edges=edges, edge_attr=None,
                                    node_mask=am.view(BN * N, -1), edge_mask=edge_mask, n_nodes=N)
-
-        y = (pred * self.mad + self.mean).detach().view(BN)
         
-        y[~valid] = float('nan')
-        return y, valid
-
-@dataclass
-class GRPOConfig:
-    run_name: str
-    vocab_dir: str
-    tokenizer: str = "simple"    
-    max_len: int = 640
-    n_layer: int = 24
-    n_embd: int = 768
-    sft_ckpt: str = "" 
-    model: str = "mamba"
-    reward_model: str = "egnn"
-    n_head: int = 8
-    # generation
-    temperature: float = 1.0
-    topk: int = 80
-    eos_token: str = "</s>"
-    pad_token: str = "<pad>"
-    # GRPO
-    group_size: int = 8
-    batch_conditions: int = 8
-    clip_eps: float = 0.2
-    kl_coeff: float = 0.03
-    ppo_epochs: int = 2
-    # reward
-    invalid_penalty: float = 1.0
-    reward_scale: float = 1.0
-    # optim
-    lr: float = 5e-6
-    weight_decay: float = 0.0
-    grad_clip: float = 1.0
-    # io
-    save_every: int = 200
-    out_dir: str = "cond/grpo_weights"
-    seed: int = 42
-
-class GRPOTrainerDDP:
-    def __init__(self, cfg: GRPOConfig, prop: str, rag_path: str, classifiers_path: str, train_mean: float, train_mad: float):
-        self.cfg = cfg
+        y_pred_abs = (pred.float() * self.mad + self.mean).detach().view(BN)
+        
+        full_preds = torch.zeros(len(lines), device=self.device)
+        full_preds[valid_indices] = y_pred_abs
+        
+        return full_preds, valid_mask
+    
+class GRPOTrainer:
+    def __init__(self, args, train_mean, train_mad):
+        self.args = args
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
         torch.cuda.set_device(self.local_rank)
         dist.init_process_group(backend="nccl", init_method="env://")
         self.device = torch.device(f"cuda:{self.local_rank}")
-        set_seed(cfg.seed, rank=self.local_rank)
+        set_seed(args.seed + self.local_rank)
 
-        tok_path = os.path.join(cfg.vocab_dir, "vocab.json")
-        self.tok = load_tokenizer(tok_path, max_length=cfg.max_len, tokenizer_type=cfg.tokenizer)
-        self.vocab = self.tok.get_vocab()
-        self.pad_id = self.vocab.get(cfg.pad_token, 0)
-        self.eos_id = self.vocab.get(cfg.eos_token, None)
+        # Tokenizer
+        tok_path = os.path.join(args.vocab_dir, "vocab.json")
+        self.tok = SimpleTokenizer(args.max_len)
+        self.tok.load_vocab(tok_path)
+        self.pad_id = self.tok.vocab.get("<pad>", 0)
+        self.start_id = self.tok.vocab.get("<s>", 1)
+        self.eos_id = self.tok.vocab.get("</s>", 2)
+        vocab_size = self.tok.get_vocab_size()
 
-        # Build model with ckpt-aware config
-        ckpt = torch.load(cfg.sft_ckpt, map_location="cpu")
-        state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
-        state = _strip_module_prefix(state)
+        # Model Config & Init
+        mcfg = MambaConfig(
+            d_model=args.n_embd,
+            n_layer=args.n_layer,
+            vocab_size=vocab_size,
+            auto_fp16to32=args.auto_fp16to32
+        )
+        model = PoeticMamba(mcfg, egnn_dim=args.egnn_dim, device=self.device).to(self.device)
 
-        ckpt_n_layers = _infer_n_layers_from_state(state)
-        if ckpt_n_layers is not None and ckpt_n_layers != cfg.n_layer:
-            print(f"[info] override cfg.n_layer: {cfg.n_layer} -> {ckpt_n_layers}")
-            cfg.n_layer = ckpt_n_layers
+        print(f"Loading SFT checkpoint from {args.sft_ckpt}")
+        ckpt = torch.load(args.sft_ckpt, map_location="cpu")
+        state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
+        new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(new_state_dict, strict=True)
 
-        if cfg.model == 'mamba':
-            from model.mamba import MambaLMHeadModel, MambaConfig
-
-            has_pln = _infer_has_per_layer_norm(state)
-            fused_add_norm = not has_pln
-            mcfg = MambaConfig(
-                d_model=cfg.n_embd,
-                n_layer=cfg.n_layer,
-                vocab_size=len(self.vocab),
-                ssm_cfg={},  
-                rms_norm=True,
-                residual_in_fp32=True,
-                fused_add_norm=fused_add_norm,
-                pad_vocab_size_multiple=8,  
-                num_props=0,  
-                scaffold=None,  
-                isconditional=True,  
-                auto_fp16to32=True,  
-            )
-            model = MambaLMHeadModel(mcfg).to(self.device)
-
-            model_keys = list(model.state_dict().keys())
-            state_try = _maybe_remap_block_name_keys(state, model_keys)
-
-            res = model.load_state_dict(state_try, strict=False)
-            print(f"[load_state_dict] missing={len(res.missing_keys)}, unexpected={len(res.unexpected_keys)}")
-            if len(res.missing_keys) > 0:
-                print("[warn] missing keys:", res.missing_keys[:5])
-            if len(res.unexpected_keys) > 0:
-                print("[warn] unexpected keys:", res.unexpected_keys[:5])
-            if len(res.missing_keys) == 0 and len(res.unexpected_keys) == 0:
-                model.load_state_dict(state_try, strict=True)
-            else:
-                if fused_add_norm and any(".norm." in k for k in res.unexpected_keys):
-                    print("[warn] Filtering per-layer norm params from ckpt (fused_add_norm=True, no corresponding modules).")
-                    filtered = {k: v for k, v in state_try.items() if (".layers." not in k or ".norm." not in k)}
-                    res2 = model.load_state_dict(filtered, strict=False)
-                    print(f"[reload after filtering norm] missing={len(res2.missing_keys)}, unexpected={len(res2.unexpected_keys)}")
-                    if len(res2.missing_keys) == 0 and len(res2.unexpected_keys) == 0:
-                        model.load_state_dict(filtered, strict=True)
-                    else:
-                        print("[warn] Mismatch keys still exist after filtering, check d_model/vocab/isconditional/ssm_cfg consistency; continuing non-strict.")
-                else:
-                    print("[warn] Mismatch keys exist, check d_model/vocab/isconditional/ssm_cfg consistency; continuing non-strict.")
-
-        elif cfg.model == 'gpt':
-            from model.gpt import GPT, GPTConfig
-            gcfg = GPTConfig(
-                vocab_size=len(self.vocab), block_size=cfg.max_len, n_layer=cfg.n_layer,
-                n_head=cfg.n_head, n_embd=cfg.n_embd, isconditional=True, lstm=False
-            )
-            model = GPT(gcfg).to(self.device)
-            model.load_state_dict(state, strict=True)
-
-        self.ref_model = copy.deepcopy(model).to(self.device).eval()
+        # Reference Model (Frozen)
+        self.ref_model = copy.deepcopy(model)
+        self.ref_model.eval()
+        for p in self.ref_model.parameters(): p.requires_grad = False
+        
+        # Active Model
         self.model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=False)
-
-        with open(rag_path, "r", encoding="utf-8") as f:
-            self.rag_lines = [ln.strip() for ln in f if ln.strip()]
-
-        self.reward_model = RewardEvaluator(
-            reward_model_type=cfg.reward_model, 
-            classifiers_path=classifiers_path, 
-            prop_name=prop, 
-            device=self.device, 
-            max_num_atoms=40,
-            train_mean=train_mean, 
-            train_mad=train_mad 
+        
+        # Reward Model (EGNN)
+        self.train_mean = train_mean
+        self.train_mad = train_mad
+        self.reward_model = RewardModel(
+            classifier_path=args.classifier_path,
+            device=self.device,
+            train_mean=train_mean,
+            train_mad=train_mad
         )
 
-        self.opt = torch.optim.AdamW(self.model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        # Optimizer
+        self.opt = torch.optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         self.scaler = GradScaler(enabled=True)
-        os.makedirs(cfg.out_dir, exist_ok=True)
-        dist.barrier()
 
-    def _pick_conditions(self, B: int) -> List[str]:
-        """Samples a batch of conditions from the RAG lines."""
-        return random.sample(self.rag_lines, B)
+        # Dataset
+        with open(args.root_path, 'r') as f:
+            train_texts = [line.strip() for line in f.readlines() if line.strip()]
+        with open(args.prop_path, 'r') as f:
+            train_props = f.readlines()
 
-    def _encode_prefix_batch(self, prefixes: List[str], repeats_each: int):
-        """Encodes prefixes and extracts target values for a batch."""
-        ids_list, prefix_lens, targets = [], [], []
-        failed_extract_count = 0
-        for s in prefixes:
-            try:
-                val = float(_extract_value(s))
-            except Exception as e:
-                if self.local_rank == 0:
-                    print(f"[{self.local_rank}] [warn] Value extract failed for prefix '{s[:50]}...': {e}. Default to 0.0")
-                val = 0.0
-                failed_extract_count += 1
-            for _ in range(repeats_each):
-                # generation_encode adds <s> token
-                seq = torch.tensor(self.tok.generation_encode(s), dtype=torch.long)
-                ids_list.append(seq)
-                prefix_lens.append(len(seq))
-                targets.append(val)
+        self.dataset = SoftRAGDataset(
+            target_texts=train_texts,
+            target_props=train_props,
+            tokenizer=self.tok,
+            db_emb_path=args.db_emb_path,
+            db_prop_path=args.db_prop_path,
+            retrieval_path=args.retrieval_path,
+            split='train',
+            max_len=args.max_len
+        )
+        
+        self.dataloader = DataLoader(
+            self.dataset, 
+            batch_size=args.batch_conditions,
+            shuffle=True, 
+            num_workers=8,
+            drop_last=True
+        )
+        self.data_iter = iter(self.dataloader)
 
-        if failed_extract_count == len(prefixes):
-            if self.local_rank == 0:
-                print(f"[{self.local_rank}] [warn] All values extract failed in batch_conditions; signaling to skip iter.")
-            return None, None, None
+        os.makedirs(args.out_dir, exist_ok=True)
 
-        input_ids = pad_sequence(ids_list, batch_first=True, padding_value=self.pad_id).to(self.device)
-        return input_ids, prefix_lens, torch.tensor(targets, dtype=torch.float32, device=self.device)
+    def _get_batch(self):
+        try:
+            batch = next(self.data_iter)
+        except StopIteration:
+            self.data_iter = iter(self.dataloader)
+            batch = next(self.data_iter)
+        return [x.to(self.device) for x in batch]
 
-    def _decode_tails(self, seqs: torch.Tensor, prefix_lens: List[int]) -> List[str]:
-        """Decodes the generated tail part of the sequences."""
-        tails = []
-        for i, seq in enumerate(seqs):
-            eff_len = int((seq != self.pad_id).sum().item())
-            pre = min(prefix_lens[i], eff_len)
-            tail = seq[pre:eff_len]
-
-            if self.eos_id is not None and tail.numel() > 0:
-                eos_pos = (tail == self.eos_id).nonzero(as_tuple=False)
-                if eos_pos.numel() > 0:
-                    tail = tail[: int(eos_pos[0].item())]
-
-            tail = tail[tail != self.pad_id]
-
-            if tail.numel() == 0:
-                tails.append("")
-            else:
-                tails.append(self.tok.decode(tail))
-        return tails
-
-    def _save_if_main(self, step):
-        """Saves model checkpoint if it's the main process and at a save interval."""
-        if dist.get_rank() == 0 and (step % self.cfg.save_every == 0):
-            out = os.path.join(self.cfg.out_dir, f"{self.cfg.run_name}_grpo_step{step}.pt")
-            torch.save({"model_state_dict": self.model.module.state_dict()}, out)
-
-    def train(self, total_iters: int = 2000):
-        """Main GRPO training loop."""
-        cfg = self.cfg
-        if dist.get_rank() == 0:
-            print(f"[GRPO-DDP] world_size={self.world_size}")
+    def train(self, total_iters=1000):
+        if self.local_rank == 0:
+            print(f"Starting GRPO Training for {total_iters} steps...")
+            print(f"MAE Normalization MAD: {self.train_mad:.4f}")
 
         for step in range(1, total_iters + 1):
-            os.environ['GRPO_STEP'] = str(step)
-
-            cond_batch = self._pick_conditions(cfg.batch_conditions)
-            in_ids, prefix_lens, targets = self._encode_prefix_batch(cond_batch, cfg.group_size)
-            if in_ids is None:
-                if self.local_rank == 0:
-                    print(f"[{self.local_rank}] [it {step}] Skip due to all value extract failed in batch.")
-                continue
-
-            with torch.no_grad():
-                self.model.eval()
-                seqs = generate_autoregressive(
-                    self.model.module, in_ids, max_len=cfg.max_len,
-                    temp=cfg.temperature, top_k=cfg.topk,
-                    eos_id=self.eos_id, pad_id=self.pad_id,
-                    tokenizer=self.tok,   
-                )
-
-            tails = self._decode_tails(seqs, prefix_lens)
-            lines = [f"{targets[i].item()} {tails[i]}" for i in range(len(tails))]
-            pred_y, valid_mask = self.reward_model.predict(lines)
-
-            mae = torch.abs(pred_y - targets)
-            is_nan = torch.isnan(mae) | (~valid_mask)
-
-            vmae = mae[~is_nan]
-            if vmae.numel() > 0 and not torch.isnan(vmae).any():
-                sigma = (0.8 * vmae.detach().median()).clamp_min(1e-6)
-            else:
-                sigma = torch.tensor(1.0, device=self.device)
-
-            raw_reward = torch.empty_like(mae).fill_(-cfg.invalid_penalty)
-            if vmae.numel() > 0:
-                raw_reward[~is_nan] = torch.exp(-(vmae / sigma))
-            raw_reward = torch.nan_to_num(cfg.reward_scale * raw_reward, nan=-cfg.invalid_penalty)
-
-            adv_tokens_flat = torch.empty_like(raw_reward)
-            for g in range(len(cond_batch)):
-                s = g * cfg.group_size; e = s + cfg.group_size
-                grp_rewards = raw_reward[s:e]
-                mu = grp_rewards.mean()
-                sd = grp_rewards.std(unbiased=False)
-
-                normalized_grp = (grp_rewards - mu) / (sd + 1e-6)
-                adv_tokens_flat[s:e] = torch.clamp(normalized_grp, -5.0, 5.0)  # Clamp advantage values
+            ref_egnn_vec, _, ref_prop, target_prop = self._get_batch()
+            
+            G = self.args.group_size
+            ref_egnn_vec = ref_egnn_vec.repeat_interleave(G, dim=0)   # [B*G, Dim]
+            ref_prop = ref_prop.repeat_interleave(G, dim=0)           # [B*G, 1]
+            target_prop = target_prop.repeat_interleave(G, dim=0)     # [B*G, 1]
+            
+            current_bs = ref_egnn_vec.size(0)
 
             with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=True):
-                    old_lp = token_logprobs(self.model.module, seqs)
-                    ref_lp = token_logprobs(self.ref_model, seqs)
+                model_inner = self.model.module
+                ref_emb = model_inner.mol_projector(ref_egnn_vec)        # [B*G, 1, H]
+                target_emb = model_inner.prop_projector(target_prop)     # [B*G, 1, H]
+                delta = target_prop - ref_prop
+                delta_emb = model_inner.delta_projector(delta)           # [B*G, 1, H]
+                
+                prefix_embeds = torch.cat([ref_emb, target_emb, delta_emb], dim=1) # [B*G, 3, H]
+                
+                # Start Token
+                start_tokens = torch.full((current_bs, 1), self.start_id, dtype=torch.long, device=self.device)
+                start_emb = model_inner.backbone.embedding(start_tokens)
+                
+                initial_embeds = torch.cat([prefix_embeds, start_emb], dim=1) # [B*G, 4, H]
 
-            adv_tokens = adv_tokens_flat.unsqueeze(1).expand_as(old_lp).detach()
+            gen_seqs, log_probs_gen = self._generate_poetic(
+                initial_embeds, 
+                max_len=self.args.max_len, 
+                temp=self.args.temperature, 
+                top_k=self.args.topk
+            )
+            
+            gen_texts = []
+            for seq in gen_seqs:
+                if (seq == self.eos_id).any():
+                    end_idx = (seq == self.eos_id).nonzero()[0].item()
+                    seq = seq[:end_idx]
+                gen_texts.append(self.tok.decode(seq))
 
-            mask = build_mask_after_prefix(seqs, prefix_lens, self.pad_id)
+            egnn_preds, egnn_valid_mask = self.reward_model.predict_batch(gen_texts)
+            
+            rewards = torch.zeros(current_bs, device=self.device).fill_(-self.args.invalid_penalty)
+            
+            group_smiles_tracker = [set() for _ in range(self.args.batch_conditions)]
+            
+            valid_count = 0
+            unique_valid_count = 0
+            mae_list = []
 
-            self.model.train()
-            for ei in range(cfg.ppo_epochs):
-                self.opt.zero_grad(set_to_none=True)
+            for i in range(current_bs):
+                group_idx = i // G
+                
+                if not egnn_valid_mask[i]:
+                    continue 
+                
+                smi, is_chem_valid = validate(gen_texts[i])
+                if not is_chem_valid or smi is None:
+                    continue
+                
+                valid_count += 1
+                
+                if smi in group_smiles_tracker[group_idx]:
+                    rewards[i] = -0.5
+                    continue
+                
+                group_smiles_tracker[group_idx].add(smi)
+                unique_valid_count += 1
+
+                pred_val = egnn_preds[i]
+                target_val = target_prop[i].squeeze()
+                abs_err = torch.abs(pred_val - target_val).item()
+                mae_list.append(abs_err)
+
+                rel_err = abs_err / (self.train_mad + 1e-6)
+                
+                r_base = math.exp(-rel_err) 
+                
+                r_bonus = 0.0
+                if rel_err < 0.2:  
+                    r_bonus = 0.5
+                if rel_err < 0.05: 
+                    r_bonus = 1.0
+                
+                rewards[i] = (r_base + r_bonus) * self.args.reward_scale
+
+            advantages = torch.zeros_like(rewards)
+            for g in range(self.args.batch_conditions):
+                s = g * G
+                e = s + G
+                grp_r = rewards[s:e]
+                std = grp_r.std()
+                if std < 1e-6: std = 1.0
+                advantages[s:e] = (grp_r - grp_r.mean()) / std
+
+            prefix_embeds_det = prefix_embeds.detach()
+
+            full_seqs = torch.cat([start_tokens, gen_seqs], dim=1) # [B*G, 1+L]
+            targets = full_seqs[:, 1:].clone() # [B*G, L]
+            loss_mask = (targets != self.pad_id)
+            
+            with torch.no_grad():
+                # Ref model forward
+                # Ref model embedding
+                ref_seq_emb = self.ref_model.backbone.embedding(full_seqs)
+                ref_inputs = torch.cat([prefix_embeds_det, ref_seq_emb], dim=1) # [B*G, 3 + 1 + L, H]
+                
+                ref_logits = self.ref_model.backbone(inputs_embeds=ref_inputs)
+                # Head
+                ref_logits = self.ref_model.lm_head(ref_logits) # [B*G, SeqLen, V]
+                
+                gen_logits_ref = ref_logits[:, 3:-1, :] # [B*G, L, V]
+                
+                ref_logprobs = F.log_softmax(gen_logits_ref, dim=-1)
+                ref_token_logprobs = torch.gather(ref_logprobs, -1, targets.unsqueeze(-1)).squeeze(-1)
+
+            for _ in range(self.args.ppo_epochs):
+                self.opt.zero_grad()
+                
                 with autocast(enabled=True):
-                    new_lp = token_logprobs(self.model, seqs)
+                    curr_ref_emb = self.model.module.mol_projector(ref_egnn_vec)
+                    curr_tgt_emb = self.model.module.prop_projector(target_prop)
+                    curr_delta = self.model.module.delta_projector(target_prop - ref_prop)
+                    curr_prefix = torch.cat([curr_ref_emb, curr_tgt_emb, curr_delta], dim=1)
+                    
+                    curr_seq_emb = self.model.module.backbone.embedding(full_seqs)
+                    curr_inputs = torch.cat([curr_prefix, curr_seq_emb], dim=1)
+                    
+                    logits = self.model.module.lm_head(self.model.module.backbone(inputs_embeds=curr_inputs))
+                    gen_logits = logits[:, 3:-1, :]
+                    
+                    logprobs = F.log_softmax(gen_logits, dim=-1)
+                    token_logprobs = torch.gather(logprobs, -1, targets.unsqueeze(-1)).squeeze(-1)
+                    
+                    # PPO Loss
+                    ratio = torch.exp(token_logprobs - ref_token_logprobs.detach())
+                    adv_expanded = advantages.unsqueeze(1).expand_as(token_logprobs)
+                    
+                    pg_loss1 = -adv_expanded * ratio
+                    pg_loss2 = -adv_expanded * torch.clamp(ratio, 1.0 - self.args.clip_eps, 1.0 + self.args.clip_eps)
+                    pg_loss = torch.sum(torch.max(pg_loss1, pg_loss2) * loss_mask) / loss_mask.sum()
+                    
+                    
+                    kl_div = ref_token_logprobs.detach() - token_logprobs
+                    kl_loss = self.args.kl_coeff * torch.sum(kl_div * loss_mask) / loss_mask.sum()
 
-                    old_lp_det = old_lp.detach()
-                    ref_lp_det = ref_lp.detach()
-                    mask_det = mask.detach()
-
-                    ratio = torch.exp((new_lp - old_lp_det))[mask_det]
-                    adv = adv_tokens[mask_det]
-
-                    obj1 = ratio * adv
-                    obj2 = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * adv
-
-                    ppo_policy_loss = -torch.mean(torch.min(obj1, obj2))
-
-                    log_diff_ref_new = ref_lp_det - new_lp
-                    kl_per_token = (torch.exp(log_diff_ref_new) - log_diff_ref_new - 1.0)[mask_det]
-                    kl_reg_loss = cfg.kl_coeff * torch.mean(kl_per_token)
-
-                    loss = ppo_policy_loss + kl_reg_loss
-
+                    loss = pg_loss + kl_loss
+                
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.opt)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
                 self.scaler.step(self.opt)
                 self.scaler.update()
 
-            if dist.get_rank() == 0:
-                valid_mae = mae[~is_nan]
-                avg_mae = float(valid_mae.mean().item()) if valid_mae.numel() > 0 else float('nan')
-                med_mae = float(valid_mae.median().item()) if valid_mae.numel() > 0 else float('nan')
-                avg_r = float(raw_reward.mean().item())
-                valid_rate = 1.0 - float(is_nan.float().mean().item())
-                print(f"[{self.local_rank}] [it {step}] MAE: {avg_mae:.4f} (Med {med_mae:.4f}) | Valid: {valid_rate:.2%} | Raw R: {avg_r:.4f} | Sigma: {sigma:.4f} | KL_loss: {kl_reg_loss.item():.4f} | Total_loss: {loss.item():.4f}")
+            # Logging
+            if self.local_rank == 0:
+                avg_r = rewards.mean().item()
+                valid_rate = valid_count / current_bs
+                unique_rate = unique_valid_count / current_bs
+                avg_mae = np.mean(mae_list) if mae_list else 0.0
+                print(f"Step {step} | R: {avg_r:.4f} | Val: {valid_rate:.1%} | Uniq: {unique_rate:.1%} | MAE: {avg_mae:.4f} | Loss: {loss.item():.4f}")
 
-            self._save_if_main(step)
-
-        if dist.get_rank() == 0:
-            out = os.path.join(self.cfg.out_dir, f"{self.cfg.run_name}_grpo_last.pt")
-            torch.save({"model_state_dict": self.model.module.state_dict()}, out)
-            print(f"[GRPO-DDP] saved to: {out}")
-        dist.barrier()  
-
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    # Base configuration parameters
-    parser.add_argument("--run_name", type=str, required=True, help="Name for the GRPO run.")
-    parser.add_argument("--vocab_dir", type=str, required=True, help="Path to tokenizer vocab directory (contains vocab.json).")
-    parser.add_argument("--tokenizer", type=str, default="simple", choices=["simple","subch"], help="Type of tokenizer to use.")
-    parser.add_argument("--max_len", type=int, default=200, help="Maximum sequence length for model input.")
-    # Model architecture parameters
-    parser.add_argument("--model", type=str, default="gpt", choices=["gpt", "mamba"])
-    parser.add_argument("--reward_model", type=str, default="egnn", choices=["egnn", "schnet"], help="Reward model type to use.")
-    parser.add_argument("--n_head", type=int, default=8, help="Heads for GPT")
-    parser.add_argument("--n_layer", type=int, default=16, help="Number of layers in the Mamba model.")
-    parser.add_argument("--n_embd", type=int, default=768, help="Embedding dimension of the Mamba model.")
-    parser.add_argument("--sft_ckpt", type=str, required=True, help="Path to the Supervised Fine-Tuned (SFT) model checkpoint.")
-    # Data and Reward parameters
-    parser.add_argument("--rag_path", type=str, required=True, help="Path to the RAG prompts file (conditions + hints).")
-    parser.add_argument("--prop", type=str, default="alpha", help="Property name to optimize (e.g., 'alpha', 'homo').")
-    parser.add_argument("--classifiers_path", type=str, required=True, help="Path to the EGNN classifier model directory.")
-    parser.add_argument("--train_mean", type=float, required=True, help="Mean of the property in training set (e.g. from compute_alchemy_stats.py)")
-    parser.add_argument("--train_mad", type=float, required=True, help="MAD of the property in training set")
-    # Sampling and GRPO specific parameters
-    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature for molecular generation.")
-    parser.add_argument("--topk", type=int, default=80, help="Top-K sampling parameter for molecular generation.")
-    parser.add_argument("--group_size", type=int, default=12, help="Number of samples per condition in a group (G in GRPO).")
-    parser.add_argument("--batch_conditions", type=int, default=16, help="Number of unique conditions processed in each training step.")
-    parser.add_argument("--clip_eps", type=float, default=0.2, help="PPO clipping epsilon (epsilon in GRPO Equation 3).")
-    parser.add_argument("--kl_coeff", type=float, default=0.03, help="KL regularization coefficient (beta in GRPO Equation 3).")
-    parser.add_argument("--ppo_epochs", type=int, default=2, help="Number of policy update epochs per training step.")
-    parser.add_argument("--invalid_penalty", type=float, default=1.0, help="Negative reward assigned to invalid/unparseable generated samples.")
-    parser.add_argument("--reward_scale", type=float, default=1.0, help="Scaling factor for the calculated rewards.")
-    parser.add_argument("--lr", type=float, default=1.2e-5, help="Learning rate for the optimizer.")
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay for the optimizer.")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping norm.")
-    parser.add_argument("--save_every", type=int, default=200, help="Save model checkpoint every N training steps.")
-    parser.add_argument("--out_dir", type=str, default="cond/grpo_weights", help="Directory to save GRPO checkpoints.")
-    parser.add_argument("--iters", type=int, default=800, help="Total number of training iterations.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
-    args = parser.parse_args()
-
-    cfg = GRPOConfig(
-        run_name=args.run_name, vocab_dir=args.vocab_dir, tokenizer=args.tokenizer, max_len=args.max_len,
-        n_layer=args.n_layer, n_embd=args.n_embd, sft_ckpt=args.sft_ckpt, model=args.model, reward_model=args.reward_model, n_head=args.n_head,
-        temperature=args.temperature, topk=args.topk, group_size=args.group_size, batch_conditions=args.batch_conditions,
-        clip_eps=args.clip_eps, kl_coeff=args.kl_coeff, ppo_epochs=args.ppo_epochs,
-        invalid_penalty=args.invalid_penalty, reward_scale=args.reward_scale,
-        lr=args.lr, weight_decay=args.weight_decay, grad_clip=args.grad_clip,
-        save_every=args.save_every, out_dir=args.out_dir, seed=args.seed
-    )
+            # Save
+            if step % self.args.save_every == 0 and self.local_rank == 0:
+                save_path = os.path.join(self.args.out_dir, f"{self.args.run_name}_step{step}.pt")
+                torch.save({'model_state_dict': self.model.module.state_dict()}, save_path)
     
-    trainer = GRPOTrainerDDP(
-        cfg, prop=args.prop, rag_path=args.rag_path,
-        classifiers_path=args.classifiers_path, train_mean=args.train_mean, train_mad=args.train_mad
-    )
+    @torch.no_grad()
+    def _generate_poetic(self, initial_embeds, max_len, temp=0.7, top_k=50):
+        self.model.eval()
+        bs = initial_embeds.size(0)
+        curr_embeds = initial_embeds
+        
+        gen_tokens = []
+        finished = torch.zeros(bs, dtype=torch.bool, device=self.device)
+        
+        for _ in range(max_len):
+            outputs = self.model.module.backbone(inputs_embeds=curr_embeds)
+            last_hidden = outputs[:, -1, :]
+            logits = self.model.module.lm_head(last_hidden) # [B, V]
 
+            logits = logits / temp
+            if top_k > 0:
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, 1) # [B, 1]
+            
+            is_eos = (next_token.squeeze(1) == self.eos_id)
+            finished = finished | is_eos
+
+            next_token = torch.where(finished.unsqueeze(1), torch.tensor(self.pad_id, device=self.device), next_token)
+            
+            gen_tokens.append(next_token)
+
+            token_emb = self.model.module.backbone.embedding(next_token)
+            curr_embeds = torch.cat([curr_embeds, token_emb], dim=1)
+            
+            if finished.all():
+                break
+                
+        return torch.cat(gen_tokens, dim=1), None
+    
+def run_ddp(rank, world_size, args, train_mean, train_mad):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    os.environ['RANK'] = str(rank)
+    os.environ['LOCAL_RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
+    
+    trainer = GRPOTrainer(args, train_mean, train_mad)
     trainer.train(total_iters=args.iters)
+    
+    dist.destroy_process_group()
+    
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_name", type=str, default="grpo_test")
+    parser.add_argument("--sft_ckpt", type=str, required=True, help="Pretrained Poetic Model Path")
+    parser.add_argument("--vocab_dir", type=str, required=True)
+    parser.add_argument("--root_path", type=str, required=True, help="Data txt path")
+    parser.add_argument("--prop_path", type=str, required=True, help="Prop txt path")
+    parser.add_argument("--db_emb_path", type=str, required=True)
+    parser.add_argument("--db_prop_path", type=str, required=True)
+    parser.add_argument("--retrieval_path", type=str, required=True)
+    parser.add_argument("--classifier_path", type=str, required=True, help="EGNN Classifier Dir")
+    
+    # Model Args
+    parser.add_argument("--n_layer", type=int, default=16)
+    parser.add_argument("--n_embd", type=int, default=768)
+    parser.add_argument("--egnn_dim", type=int, default=128)
+    parser.add_argument("--auto_fp16to32", action='store_true')
+    
+    # RL Args
+    parser.add_argument("--lr", type=float, default=1e-6)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--batch_conditions", type=int, default=4, help="Number of queries per step")
+    parser.add_argument("--group_size", type=int, default=8, help="Samples per query")
+    parser.add_argument("--ppo_epochs", type=int, default=2)
+    parser.add_argument("--clip_eps", type=float, default=0.2)
+    parser.add_argument("--kl_coeff", type=float, default=0.05)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--save_every", type=int, default=50)
+    parser.add_argument("--out_dir", type=str, default="grpo_checkpoints")
+    parser.add_argument("--iters", type=int, default=500)
+    parser.add_argument("--seed", type=int, default=42)
+    
+    # Gen Args
+    parser.add_argument("--max_len", type=int, default=160)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--topk", type=int, default=80) 
+    
+    # Reward Args
+    parser.add_argument("--invalid_penalty", type=float, default=2.0)
+    parser.add_argument("--reward_scale", type=float, default=1.0)
+
+    args = parser.parse_args()
+    train_mean, train_mad = get_stats(args.prop_path)
+
+    world_size = torch.cuda.device_count()
+    
+    if world_size > 0:
+        mp.spawn(
+            run_ddp, 
+            args=(world_size, args, train_mean, train_mad), 
+            nprocs=world_size
+        )
+    else:
+        print("Warning: No GPU found, running on CPU (RANK 0).")
+        run_ddp(0, 1, args, train_mean, train_mad)
