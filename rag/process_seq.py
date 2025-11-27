@@ -159,7 +159,7 @@ def get_embedding(model, h0, x, edges, edge_attr, node_mask, edge_mask, n_nodes)
 def main():
     parser = argparse.ArgumentParser(description="Extract embeddings from a model.")
     parser.add_argument("--dataset", type=str, default='alchemy', help="Dataset to use for embeddings.")
-    parser.add_argument("--classifiers_path", type=str, default='./qm9/property_prediction/outputs/alchemy_gap', help="Path to the classifiers directory.")
+    parser.add_argument("--classifier_path", type=str, default='./qm9/property_prediction/outputs/alchemy_gap', help="Path to the classifiers directory.")
     parser.add_argument("--input_path", type=str, default='./data/alchemy_seq.txt', help="Path to the generated data file.")
     parser.add_argument("--save_path", type=str, default='alchemy_gap_embeddings.npz', help="Path to save the embeddings.")
     parser.add_argument("--max_num_atoms", type=int, default=40, help="Maximum number of atoms in a molecule.")
@@ -171,7 +171,7 @@ def main():
         atom_map = {'H': 0, 'C': 1, 'N': 2, 'O': 3, 'F': 4, 'P': 5, 'S': 6, 'Cl': 7, 'Br': 8, 'I': 9}
         atom_types = 10
 
-    classifier = get_classifier(args.classifiers_path, atom_types, args.device)
+    classifier = get_classifier(args.classifier_path, atom_types, args.device)
 
     dataset = CondMol(txt_file=args.input_path, atom_map=atom_map, atom_types=atom_types, max_num_atoms=args.max_num_atoms)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
