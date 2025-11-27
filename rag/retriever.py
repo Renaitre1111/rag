@@ -57,31 +57,10 @@ class MoleculeRetriever:
         
         np.savez(save_path, indices=final_indices, sims=final_sims)
 
-    def inference(self, target_vals, k_pool=100):
-        if target_vals.dim() == 1:
-            target_vals = target_vals.view(-1, 1)
-        bs = target_vals.size(0)
-
-        cand_indices = self._coarse_filter(target_vals, k_pool=k_pool) # [B, k_pool]
-        cand_embs = self.db_embeddings[cand_indices] # [B, k_pool, Dim]
-
-        cand_embs_norm = F.normalize(cand_embs, p=2, dim=2)
-        sim_mats = torch.bmm(cand_embs_norm, cand_embs_norm.transpose(1, 2)) # [B, k_pool, k_pool]
-
-        centrality = sim_mats.sum(dim=2) # [B, k_pool]
-        best_rel_indices = torch.argmax(centrality, dim=1) # [B]
-        best_db_indices = torch.gather(cand_indices, 1, best_rel_indices.unsqueeze(1))
-        best_db_indices = best_db_indices.squeeze(1) # [B]
-
-        final_ref_embs = self.db_embeddings[best_db_indices] # [B, Dim]
-        final_ref_props = self.db_properties[best_db_indices] # [B, 1]
-        
-        return final_ref_embs, final_ref_props, best_db_indices
-    
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run retrieval preprocessing.")
-    parser.add_argument("--emb_path", type=str, default='data/alchemy_gap_embeddings.npz', help="Path to the embeddings .npz file")
-    parser.add_argument("--prop_path", type=str, default='data/gap.txt', help="Path to the property .txt file")
+    parser.add_argument("--db_emb_path", type=str, default='data/alchemy_gap_embeddings.npz', help="Path to the embeddings .npz file")
+    parser.add_argument("--db_prop_path", type=str, default='data/gap.txt', help="Path to the property .txt file")
     parser.add_argument("--save_path", type=str, default='data/train_ret_gap.npz', help="Output path for the indices")
     parser.add_argument("--k_pool", type=int, default=100, help="Step 1: Coarse retrieval pool size")
     parser.add_argument("--k_fine", type=int, default=10, help="Step 2: Top-K structural matches to save")
@@ -90,5 +69,5 @@ if __name__ == '__main__':
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    retriever = MoleculeRetriever(args.emb_path, args.prop_path, device=device)
+    retriever = MoleculeRetriever(args.db_emb_path, args.db_prop_path, device=device)
     retriever.preprocess(args.save_path, k_pool=args.k_pool, k_fine=args.k_fine)

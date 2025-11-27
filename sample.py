@@ -12,7 +12,7 @@ class PropertyDistribution:
         self.probs, self.params = self._create_prob_dist(values)
         self.m = Categorical(self.probs)
 
-    def _create_prop_dist(self, values):
+    def _create_prob_dist(self, values):
         n_bins = self.num_bins
         prop_min, prop_max = torch.min(values), torch.max(values)
         prop_range = prop_max - prop_min + 1e-12
@@ -58,7 +58,7 @@ class PropertyDistribution:
 def main():
     parser = argparse.ArgumentParser(description="Sample properties from training distribution.")
     parser.add_argument('--prop_path', type=str, required=True, help="Path to training set properties (.txt)")
-    parser.add_argument('--save_path', type=str, default='sampled_gap.txt', help="Output path")
+    parser.add_argument('--save_path', type=str, default='data/sampled_gap.txt', help="Output path")
     parser.add_argument('--num_samples', type=int, default=10000, help="How many samples to generate")
     parser.add_argument('--num_bins', type=int, default=1000, help="Number of histogram bins")
     parser.add_argument('--seed', type=int, default=42)

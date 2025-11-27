@@ -41,7 +41,7 @@ def main():
     parser.add_argument('--repeats', type=int, default=1, help="Number of molecules to generate per target property")
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--ckpt_path', type=str, default=None, help="Explicit path to checkpoint. If None, inferred from run_name")
+    parser.add_argument('--ckpt_path', type=str, default=None, help="Explicit path to checkpoint.")
     parser.add_argument('--auto_fp16to32', action='store_true', default=False)
 
     args = parser.parse_args()

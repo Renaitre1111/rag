@@ -23,11 +23,21 @@ We first tokenize the QM9 dataset using Geo2Seq, which converts 3D molecular str
 python process_data_qm9.py --raw_path qm9/temp/qm9/ --write_path data/ --split valid
 ```
 
-
-## Train cVAE
 ```bash
-python rag/generate_reference.py --checkpoint_path cond/gap_weights/cvae_alchemy_gap.pth --database_path data/alchemy_gap_embeddings.npz --database_prop_path data/gap.txt --target_path data/gap.txt --output_path data/train_gap_ref.npz --remove_self --batch_size 128 --device cuda
+python rag/retriever.py --db_emb_path data/alchemy_gap_embeddings.npz --db_prop_path data/gap.txt --save_path data/train_ret_gap.npz --k_pool 100 --k_fine 10
+```
+```bash
+python rag/test_retriever.py --db_emb_path data/alchemy_gap_embeddings.npz --db_prop_path data/gap.txt --query_prop_path data/sampled_gap.txt --save_path data/test_ret_gap.npz --k_pool 100 --k_fine 10
 ```
 ```bash
 python train.py --run_name conditional_alchemy --prop gap --model poetic --root_path ./data/alchemy_seq.txt --prop_path ./data/gap.txt --db_emb_path ./data/alchemy_gap_embeddings.npz --db_prop_path ./data/gap.txt --retrieval_path data/train_ret_gap.npz --tokenizer_dir ./data/tokenizer --batch_size 160 --learning_rate 6e-4 --max_epochs 200 --num_workers 8 --max_len 160
+```
+```bash
+python sample.py --prop_path data/gap.txt --save_path data/sampled_gap.txt --num_samples 10000 --num_bins 1000 --seed 42
+```
+```bash
+python generate.py --run_name gap --tokenizer_dir ./data/tokenizer --save_path cond/gap_gens --target_prop_path data/sampled_gap.txt --test_retrieval_path data/test_ret_gap.npz --db_emb_path data/alchemy_gap_embeddings.npz --db_prop_path data/gap.txt --temperature 0.7 --topk 80 --repeats 1 --batch_size 256 --ckpt_path cond/gap_weights/conditional_alchemy.pt
+```
+```bash
+python eval_alchemy.py --generated_path cond/gap_gens/gap_generated.txt --target_path data/sampled_gap.txt --classifier_path qm9/property_prediction/outputs/alchemy_gap --property gap --train_prop_path data/gap.txt
 ```

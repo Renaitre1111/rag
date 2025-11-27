@@ -224,7 +224,7 @@ def eval(model, loader, mean, mad, device, log_interval=20):
     return res['loss'] / res['counter']
 
 def main_quantitative(args):
-    classifier = get_classifier(args.classifiers_path, args.device)
+    classifier = get_classifier(args.classifier_path, args.device)
 
     mean, mad = get_stats(args.train_prop_path)
     mean = mean.to(args.device)
@@ -247,7 +247,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--generated_path', type=str, required=True, help="Path to generated molecules (.txt)")
     parser.add_argument('--target_path', type=str, required=True, help="Path to target properties (.txt)")
-    parser.add_argument('--classifiers_path', type=str, required=True, help="Path to trained EGNN classifier")
+    parser.add_argument('--classifier_path', type=str, required=True, help="Path to trained EGNN classifier")
     
     parser.add_argument('--property', type=str, default='gap')
     parser.add_argument('--train_prop_path', type=str, required=True, help="Path to training properties (.txt)")
