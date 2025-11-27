@@ -50,6 +50,9 @@ for _, row in df.iterrows():
     if mol is None or mol.GetNumConformers() == 0:
         continue
 
+    mol_no_h = Chem.RemoveHs(mol)
+    smiles = Chem.MolToSmiles(mol_no_h, isomericSmiles=True)
+
     conf = mol.GetConformer()
     coords = conf.GetPositions()              # (N, 3)
     charges = [atom.GetAtomicNum() for atom in mol.GetAtoms()]  # (N,)
@@ -63,6 +66,7 @@ for _, row in df.iterrows():
         "charges": np.array(charges, dtype=np.int64),
         "positions": coords.astype(np.float32),
         "props": props,
+        "smiles": smiles,
     })
 
 print("Total valid molecules:", len(records))
@@ -75,6 +79,7 @@ pos_arr = np.zeros((num_mol, max_n, 3), dtype=np.float32)
 num_atoms_arr = np.zeros(num_mol, dtype=np.int64)
 index_arr = np.zeros(num_mol, dtype=np.int64)
 props_arr = np.zeros((num_mol, len(target_cols)), dtype=np.float32)
+smiles_arr = np.empty(num_mol, dtype=object)
 
 for i, r in enumerate(records):
     n = r["num_atoms"]
@@ -83,6 +88,7 @@ for i, r in enumerate(records):
     num_atoms_arr[i] = n
     index_arr[i] = r["gdb_idx"]
     props_arr[i] = r["props"]
+    smiles_arr[i] = r["smiles"]
 
 np.random.seed(42)  
 perm = np.random.permutation(num_mol)
@@ -112,6 +118,11 @@ def save_split(name, idx):
         index=index_arr[idx],
         props=props_arr[idx],
     )
+    
+    smiles_filename = f"alchemy_{name}_smiles.npy"
+    np.save(smiles_filename, smiles_arr[idx])
+    
+    print(f"Saved: alchemy_{name}.npz AND {smiles_filename}")
 
 save_split("train_gen", train_gen_idx)
 save_split("train_eval", train_eval_idx)
