@@ -19,7 +19,7 @@ from tqdm import tqdm
 import pickle
 from qm9.property_prediction.schnet import SchNet
 from dataset import SimpleTokenizer
-from eval_conditional_qm9 import get_classifier, get_args_gen, get_dataloader
+from eval_qm9 import get_classifier, get_args_gen, get_dataloader
 from qm9.utils import compute_mean_mad
 from qm9.property_prediction.prop_utils import get_adj_matrix
 
