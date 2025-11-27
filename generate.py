@@ -171,13 +171,6 @@ def main():
             generated_ids = torch.cat(generated_seqs, dim=1)
             
             for i in range(curr_bs):
-                raw_idx = batch_idx * args.batch_size + (i // args.repeats)
-                
-                if raw_idx < len(target_props):
-                    val_str = f"{target_props[raw_idx]:.2f}"
-                else:
-                    val_str = "0.0000"
-
                 seq = generated_ids[i]
                 
                 if (seq == eos_id).any():
@@ -186,7 +179,7 @@ def main():
                 
                 mol_seq = tokenizer.decode(seq)
                 
-                results.append(f"{val_str} {mol_seq}\n")
+                results.append(f"{mol_seq}\n")
 
     with open(output_file, 'w') as f:
         f.writelines(results)

@@ -25,16 +25,9 @@ python process_data_qm9.py --raw_path qm9/temp/qm9/ --write_path data/ --split v
 
 
 ## Train cVAE
-
-```bash
-python train_cvae.py --embedding_path alchemy_gap_embeddings.npz --property_path data/gap.txt --save_path cvae_alchemy_gap.pth --epochs 150
-```
 ```bash
 python rag/generate_reference.py --checkpoint_path cond/gap_weights/cvae_alchemy_gap.pth --database_path data/alchemy_gap_embeddings.npz --database_prop_path data/gap.txt --target_path data/gap.txt --output_path data/train_gap_ref.npz --remove_self --batch_size 128 --device cuda
 ```
 ```bash
 python train.py --run_name conditional_alchemy --prop gap --model poetic --root_path ./data/alchemy_seq.txt --prop_path ./data/gap.txt --db_emb_path ./data/alchemy_gap_embeddings.npz --db_prop_path ./data/gap.txt --retrieval_path data/train_ret_gap.npz --tokenizer_dir ./data/tokenizer --batch_size 160 --learning_rate 6e-4 --max_epochs 200 --num_workers 8 --max_len 160
-```
-```bash
-python preprocess.py --root_path ./data/alchemy_seq --tokenizer_dir ./data/tokenizer --max_len 512
 ```
