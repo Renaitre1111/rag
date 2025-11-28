@@ -310,31 +310,35 @@ class GRPOTrainer:
             print(f"MAE Normalization MAD: {self.train_mad:.4f}")
 
         for step in range(1, total_iters + 1):
-            ref_egnn_vec, _, ref_prop, target_prop = self._get_batch()
+            ref_egnn_vec, _, ref_prop, real_target_prop = self._get_batch()
+
+            noise_sigma = 0.03 * self.train_mad 
+            noise = torch.randn_like(real_target_prop) * noise_sigma
+            aug_target_prop = real_target_prop + noise
             
             G = self.args.group_size
             ref_egnn_vec = ref_egnn_vec.repeat_interleave(G, dim=0)   # [B*G, Dim]
             ref_prop = ref_prop.repeat_interleave(G, dim=0)           # [B*G, 1]
-            target_prop = target_prop.repeat_interleave(G, dim=0)     # [B*G, 1]
+            
+            target_prop = aug_target_prop.repeat_interleave(G, dim=0) # [B*G, 1]
             
             current_bs = ref_egnn_vec.size(0)
 
             with torch.no_grad():
                 model_inner = self.model.module
-                ref_emb = model_inner.mol_projector(ref_egnn_vec)        # [B*G, 1, H]
-                target_emb = model_inner.prop_projector(target_prop)     # [B*G, 1, H]
+                ref_emb = model_inner.mol_projector(ref_egnn_vec)        
+                target_emb = model_inner.prop_projector(target_prop)     
                 delta = target_prop - ref_prop
-                delta_emb = model_inner.delta_projector(delta)           # [B*G, 1, H]
+                delta_emb = model_inner.delta_projector(delta)           
                 
-                prefix_embeds = torch.cat([ref_emb, target_emb, delta_emb], dim=1) # [B*G, 3, H]
+                prefix_embeds = torch.cat([ref_emb, target_emb, delta_emb], dim=1) 
                 
-                # Start Token
                 start_tokens = torch.full((current_bs, 1), self.start_id, dtype=torch.long, device=self.device)
                 start_emb = model_inner.backbone.embedding(start_tokens)
                 
-                initial_embeds = torch.cat([prefix_embeds, start_emb], dim=1) # [B*G, 4, H]
+                initial_embeds = torch.cat([prefix_embeds, start_emb], dim=1) 
 
-            gen_seqs, log_probs_gen = self._generate_poetic(
+            gen_seqs, _ = self._generate_poetic(
                 initial_embeds, 
                 max_len=self.args.max_len, 
                 temp=self.args.temperature, 
@@ -371,29 +375,37 @@ class GRPOTrainer:
                 valid_count += 1
                 
                 if smi in group_smiles_tracker[group_idx]:
-                    rewards[i] = -0.5
+                    rewards[i] = -0.5 
                     continue
                 
                 group_smiles_tracker[group_idx].add(smi)
                 unique_valid_count += 1
 
+                # Accuracy Calculation
                 pred_val = egnn_preds[i]
                 target_val = target_prop[i].squeeze()
                 abs_err = torch.abs(pred_val - target_val).item()
                 mae_list.append(abs_err)
 
+                # Linear Reward Components
                 rel_err = abs_err / (self.train_mad + 1e-6)
                 
-                r_base = math.exp(-rel_err) 
+                r_acc = max(-1.0, 1.0 - 0.5 * rel_err)
+                
+                r_valid = 0.1
                 
                 r_bonus = 0.0
-                if rel_err < 0.2:  
+                if rel_err < 0.1: 
                     r_bonus = 0.5
-                if rel_err < 0.05: 
-                    r_bonus = 1.0
-                
-                rewards[i] = (r_base + r_bonus) * self.args.reward_scale
 
+                if rel_err < 2.0:
+                    r_total = r_acc + r_valid + r_bonus
+                else:
+                    r_total = r_acc + 0.1 * r_valid
+                
+                rewards[i] = r_total * self.args.reward_scale
+
+            # Advantage Normalization
             advantages = torch.zeros_like(rewards)
             for g in range(self.args.batch_conditions):
                 s = g * G
@@ -403,27 +415,25 @@ class GRPOTrainer:
                 if std < 1e-6: std = 1.0
                 advantages[s:e] = (grp_r - grp_r.mean()) / std
 
+            # PPO Update Preparation
             prefix_embeds_det = prefix_embeds.detach()
-
-            full_seqs = torch.cat([start_tokens, gen_seqs], dim=1) # [B*G, 1+L]
-            targets = full_seqs[:, 1:].clone() # [B*G, L]
+            full_seqs = torch.cat([start_tokens, gen_seqs], dim=1) 
+            targets = full_seqs[:, 1:].clone() 
             loss_mask = (targets != self.pad_id)
             
+            # Reference LogProbs
             with torch.no_grad():
-                # Ref model forward
-                # Ref model embedding
                 ref_seq_emb = self.ref_model.backbone.embedding(full_seqs)
-                ref_inputs = torch.cat([prefix_embeds_det, ref_seq_emb], dim=1) # [B*G, 3 + 1 + L, H]
+                ref_inputs = torch.cat([prefix_embeds_det, ref_seq_emb], dim=1)
                 
                 ref_logits = self.ref_model.backbone(inputs_embeds=ref_inputs)
-                # Head
-                ref_logits = self.ref_model.lm_head(ref_logits) # [B*G, SeqLen, V]
+                ref_logits = self.ref_model.lm_head(ref_logits) 
                 
-                gen_logits_ref = ref_logits[:, 3:-1, :] # [B*G, L, V]
-                
+                gen_logits_ref = ref_logits[:, 3:-1, :] 
                 ref_logprobs = F.log_softmax(gen_logits_ref, dim=-1)
                 ref_token_logprobs = torch.gather(ref_logprobs, -1, targets.unsqueeze(-1)).squeeze(-1)
 
+            # PPO Epochs
             for _ in range(self.args.ppo_epochs):
                 self.opt.zero_grad()
                 
@@ -442,14 +452,13 @@ class GRPOTrainer:
                     logprobs = F.log_softmax(gen_logits, dim=-1)
                     token_logprobs = torch.gather(logprobs, -1, targets.unsqueeze(-1)).squeeze(-1)
                     
-                    # PPO Loss
+                    # Loss
                     ratio = torch.exp(token_logprobs - ref_token_logprobs.detach())
                     adv_expanded = advantages.unsqueeze(1).expand_as(token_logprobs)
                     
                     pg_loss1 = -adv_expanded * ratio
                     pg_loss2 = -adv_expanded * torch.clamp(ratio, 1.0 - self.args.clip_eps, 1.0 + self.args.clip_eps)
                     pg_loss = torch.sum(torch.max(pg_loss1, pg_loss2) * loss_mask) / loss_mask.sum()
-                    
                     
                     kl_div = ref_token_logprobs.detach() - token_logprobs
                     kl_loss = self.args.kl_coeff * torch.sum(kl_div * loss_mask) / loss_mask.sum()
@@ -549,7 +558,7 @@ if __name__ == "__main__":
     parser.add_argument("--group_size", type=int, default=8, help="Samples per query")
     parser.add_argument("--ppo_epochs", type=int, default=2)
     parser.add_argument("--clip_eps", type=float, default=0.2)
-    parser.add_argument("--kl_coeff", type=float, default=0.05)
+    parser.add_argument("--kl_coeff", type=float, default=0.1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--save_every", type=int, default=50)
     parser.add_argument("--out_dir", type=str, default="grpo_checkpoints")
