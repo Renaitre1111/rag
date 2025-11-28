@@ -26,6 +26,9 @@ python rag/process_seq.py --dataset alchemy --classifier_path qm9/property_predi
 python rag/retriever.py --db_emb_path data/gap/alchemy_gap_embeddings.npz --db_prop_path data/gap/gap.txt --save_path data/gap/train_ret_gap.npz --k_pool 100 --k_fine 10
 ```
 ```bash
+python rag/finetune_retriever.py --db_emb_path data/gap/alchemy_gap_embeddings.npz --db_prop_path data/gap/gap.txt --prop_path data/gap/gap.txt --save_path data/gap/finetune_ret_gap.npz --k_pool 100 --k_fine 10
+```
+```bash
 python rag/test_retriever.py --db_emb_path data/gap/alchemy_gap_embeddings.npz --db_prop_path data/gap/gap.txt --query_prop_path data/gap/sampled_gap.txt --save_path data/gap/test_ret_gap.npz --k_pool 100 --k_fine 10
 ```
 ```bash

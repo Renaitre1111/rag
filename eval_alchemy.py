@@ -9,7 +9,6 @@ from tqdm import tqdm
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join('../../')))
-from qm9.property_prediction import main_qm9_prop
 from qm9.property_prediction.models_property import EGNN, Naive, NumNodes
 
 ALCHEMY_ATOM_MAP = {

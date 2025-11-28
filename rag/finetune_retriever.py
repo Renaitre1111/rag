@@ -3,12 +3,62 @@ import torch.nn.functional as F
 import numpy as np
 import argparse
 import os
+import random
 from tqdm import tqdm
 from retriever import MoleculeRetriever
-from rag.utils import PropertyDistribution
+from torch.distributions.categorical import Categorical
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+class PropertyDistribution:
+    def __init__(self, values, num_bins=1000, device='cpu'):
+        self.num_bins = num_bins
+        self.device = device
+        values = torch.tensor([v for v in values if not (np.isnan(v) or np.isinf(v))], dtype=torch.float)
+        self.probs, self.params = self._create_prob_dist(values)
+        self.m = Categorical(self.probs)
+        self.probs = self.probs.to(device)
+
+    def _create_prob_dist(self, values):
+        n_bins = self.num_bins
+        prop_min, prop_max = torch.min(values), torch.max(values)
+        prop_range = prop_max - prop_min + 1e-12
+
+        histogram = torch.zeros(n_bins)
+        for val in values:
+            i = int((val - prop_min) / prop_range * n_bins)
+            if i == n_bins: i = n_bins - 1
+            histogram[i] += 1
+
+        probs = histogram / torch.sum(histogram)
+        params = [prop_min, prop_max]
+        return probs, params
+    
+    def _idx2value(self, idx, params, n_bins):
+        prop_min = params[0]
+        prop_max = params[1]
+        prop_range = prop_max - prop_min
+        
+        left = idx.float() / n_bins * prop_range + prop_min
+        right = (idx + 1).float() / n_bins * prop_range + prop_min
+
+        val = torch.rand(idx.shape, device=self.device) * (right - left) + left
+        return val
+    
+    def sample(self, n_samples=1):
+        idx = self.m.sample((n_samples,)).to(self.device)
+        vals = self._idx2value(idx, self.params, self.num_bins)
+        return vals.view(-1, 1) # [N, 1]
 
 class FinetuneRetriever(MoleculeRetriever):
-    def gen_finetune_data(self, prop_path, save_path, num_samples=20000, k_pool=100, k_fine=10, batch_size=1024):
+    def generate_finetune_data(self, prop_path, save_path, num_samples=20000, k_pool=100, k_fine=10, batch_size=1024):
         with open(prop_path, 'r') as f:
             raw_values = [float(line.strip().split()[0]) for line in f if line.strip()]
 
@@ -57,8 +107,11 @@ if __name__ == '__main__':
     parser.add_argument("--num_samples", type=int, default=20000, help="Total prompts to generate")
     parser.add_argument("--k_pool", type=int, default=100)
     parser.add_argument("--k_fine", type=int, default=10, help="Number of references per prompt (usually use index 0)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     
     args = parser.parse_args()
+    
+    set_seed(args.seed)
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
