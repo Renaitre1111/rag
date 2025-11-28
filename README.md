@@ -38,7 +38,7 @@ python train.py --run_name conditional_alchemy --prop gap --model poetic --root_
 python sample.py --prop_path data/gap/gap.txt --save_path data/gap/sampled_gap.txt --num_samples 10000 --num_bins 1000 --seed 42
 ```
 ```bash
-python grpo_finetune_alchemy.py --run_name finetune_alchemy --sft_ckpt ./cond/gap_weights/conditional_alchemy.pt --vocab_dir ./data/tokenizer --root_path ./data/alchemy_seq.txt --prop_path ./data/gap/gap.txt --db_emb_path ./data/gap/alchemy_gap_embeddings.npz --db_prop_path ./data/gap/gap.txt --retrieval_path data/gap/train_ret_gap.npz --classifier_path qm9/property_prediction/outputs/alchemy_gap --out_dir cond/gap_weights --lr 5e-6
+python grpo_finetune_alchemy.py --run_name finetune_alchemy --sft_ckpt ./cond/gap_weights/conditional_alchemy.pt --vocab_dir ./data/tokenizer --finetune_data_path ./data/gap/finetune_ret_gap.npz --prop_path ./data/gap/gap.txt --db_emb_path ./data/gap/alchemy_gap_embeddings.npz --db_prop_path ./data/gap/gap.txt --classifier_path qm9/property_prediction/outputs/alchemy_gap --out_dir cond/gap_weights --lr 5e-6 --save_every 100 
 ```
 ```bash
 python generate.py --run_name gap --tokenizer_dir ./data/tokenizer --save_path cond/gap_gens --target_prop_path data/gap/sampled_gap.txt --test_retrieval_path data/gap/test_ret_gap.npz --db_emb_path data/gap/alchemy_gap_embeddings.npz --db_prop_path data/gap/gap.txt --temperature 0.7 --topk 80 --repeats 1 --batch_size 256 --ckpt_path cond/gap_weights/conditional_alchemy.pt

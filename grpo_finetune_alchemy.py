@@ -11,14 +11,14 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from rdkit import Chem
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
-from dataset import SimpleTokenizer, SoftRAGDataset
+from dataset import SimpleTokenizer
 from model.poetic import PoeticMamba
 from model.mamba import MambaConfig
 from qm9.property_prediction.models_property import EGNN, Naive, NumNodes
@@ -29,7 +29,6 @@ ALCHEMY_ATOM_MAP = {
     'P': 5, 'S': 6, 'Cl': 7, 'Br': 8, 'I': 9, 
 }
 NUM_ATOM_TYPES = 10
-INV_ATOM_MAP = {v: k for k, v in ALCHEMY_ATOM_MAP.items()}
 
 def set_seed(seed):
     random.seed(seed)
@@ -46,8 +45,8 @@ def validate(line: str):
         mol_data = np.array(toks).reshape(-1, 4)
         symbols = mol_data[:, 0]
 
-        for s in symbols:
-            if s not in ALCHEMY_ATOM_MAP: return None, False
+        if any(s not in ALCHEMY_ATOM_MAP for s in symbols):
+            return None, False
 
         d = mol_data[:, 1].astype(float)
         theta = np.array([float(x.replace('°', '')) for x in mol_data[:, 2]])
@@ -88,16 +87,48 @@ def validate(line: str):
         return None, False
     
 def get_stats(prop_path):
-    print(f"Loading properties from {prop_path} to compute stats...")
     with open(prop_path, 'r') as f:
         vals = [float(line.strip().split()[0]) for line in f.readlines() if line.strip()]
     
     vals = torch.tensor(vals, dtype=torch.float32)
     mean = torch.mean(vals)
-    mad = torch.mean(torch.abs(vals - mean))
+    std = torch.std(vals)   
+    mad = torch.mean(torch.abs(vals - mean)) 
     
-    print(f"Computed Stats -> Mean: {mean.item():.4f}, MAD: {mad.item():.4f}")
-    return mean.item(), mad.item()
+    print(f"Computed Stats -> Mean: {mean.item():.4f}, Std: {std.item():.4f}, MAD: {mad.item():.4f}")
+    return mean.item(), std.item(), mad.item() 
+
+class GRPODataset(Dataset):
+    def __init__(self, data_path, db_emb_path, db_prop_path, mean, std):
+        self.mean = mean
+        self.std = std
+
+        data = np.load(data_path)
+
+        raw_targets = torch.from_numpy(data['targets']).float()
+        self.targets = (raw_targets - mean) / std
+        self.ref_indices = torch.from_numpy(data['indices'][:, 0]).long()
+
+        emb_data = np.load(db_emb_path)
+        self.db_embeddings = torch.from_numpy(emb_data['embeddings']).float()
+
+        with open(db_prop_path, 'r') as f:
+            raw_db_props = [float(line.strip().split()[0]) for line in f if line.strip()]
+        
+        raw_db_props = torch.tensor(raw_db_props, dtype=torch.float).view(-1, 1)
+        self.db_props = (raw_db_props - mean) / std
+
+    def __len__(self):
+        return len(self.targets)
+
+    def __getitem__(self, idx):
+        target_val = self.targets[idx] 
+        
+        ref_idx = self.ref_indices[idx]
+        ref_vec = self.db_embeddings[ref_idx] 
+        ref_prop = self.db_props[ref_idx]     
+        
+        return ref_vec, ref_prop, target_val
 
 class RewardModel:
     def __init__(self, classifier_path, device, train_mean, train_mad, max_num_atoms=40):
@@ -213,7 +244,7 @@ class RewardModel:
         return full_preds, valid_mask
     
 class GRPOTrainer:
-    def __init__(self, args, train_mean, train_mad):
+    def __init__(self, args, train_mean, train_std, train_mad):
         self.args = args
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -222,7 +253,6 @@ class GRPOTrainer:
         self.device = torch.device(f"cuda:{self.local_rank}")
         set_seed(args.seed + self.local_rank)
 
-        # Tokenizer
         tok_path = os.path.join(args.vocab_dir, "vocab.json")
         self.tok = SimpleTokenizer(args.max_len)
         self.tok.load_vocab(tok_path)
@@ -231,7 +261,7 @@ class GRPOTrainer:
         self.eos_id = self.tok.vocab.get("</s>", 2)
         vocab_size = self.tok.get_vocab_size()
 
-        # Model Config & Init
+        # Model Init
         mcfg = MambaConfig(
             d_model=args.n_embd,
             n_layer=args.n_layer,
@@ -254,8 +284,9 @@ class GRPOTrainer:
         # Active Model
         self.model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=False)
         
-        # Reward Model (EGNN)
+        # Reward Model
         self.train_mean = train_mean
+        self.train_std = train_std
         self.train_mad = train_mad
         self.reward_model = RewardModel(
             classifier_path=args.classifier_path,
@@ -264,25 +295,15 @@ class GRPOTrainer:
             train_mad=train_mad
         )
 
-        # Optimizer
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         self.scaler = GradScaler(enabled=True)
 
-        # Dataset
-        with open(args.root_path, 'r') as f:
-            train_texts = [line.strip() for line in f.readlines() if line.strip()]
-        with open(args.prop_path, 'r') as f:
-            train_props = f.readlines()
-
-        self.dataset = SoftRAGDataset(
-            target_texts=train_texts,
-            target_props=train_props,
-            tokenizer=self.tok,
+        self.dataset = GRPODataset(
+            data_path=args.finetune_data_path,
             db_emb_path=args.db_emb_path,
             db_prop_path=args.db_prop_path,
-            retrieval_path=args.retrieval_path,
-            split='train',
-            max_len=args.max_len
+            mean=train_mean,
+            std=train_std
         )
         
         self.dataloader = DataLoader(
@@ -307,29 +328,26 @@ class GRPOTrainer:
     def train(self, total_iters=1000):
         if self.local_rank == 0:
             print(f"Starting GRPO Training for {total_iters} steps...")
-            print(f"MAE Normalization MAD: {self.train_mad:.4f}")
 
         for step in range(1, total_iters + 1):
-            ref_egnn_vec, _, ref_prop, real_target_prop = self._get_batch()
-
-            noise_sigma = 0.03 * self.train_mad 
-            noise = torch.randn_like(real_target_prop) * noise_sigma
-            aug_target_prop = real_target_prop + noise
+            ref_egnn_vec, ref_prop, target_prop = self._get_batch()
             
             G = self.args.group_size
+
             ref_egnn_vec = ref_egnn_vec.repeat_interleave(G, dim=0)   # [B*G, Dim]
             ref_prop = ref_prop.repeat_interleave(G, dim=0)           # [B*G, 1]
-            
-            target_prop = aug_target_prop.repeat_interleave(G, dim=0) # [B*G, 1]
+            target_prop = target_prop.repeat_interleave(G, dim=0)     # [B*G, 1]
             
             current_bs = ref_egnn_vec.size(0)
 
             with torch.no_grad():
                 model_inner = self.model.module
                 ref_emb = model_inner.mol_projector(ref_egnn_vec)        
-                target_emb = model_inner.prop_projector(target_prop)     
-                delta = target_prop - ref_prop
-                delta_emb = model_inner.delta_projector(delta)           
+                target_emb = model_inner.prop_projector(target_prop)
+                
+                # Delta Calculation (Crucial for learning)
+                delta_val = target_prop - ref_prop
+                delta_emb = model_inner.delta_projector(delta_val)           
                 
                 prefix_embeds = torch.cat([ref_emb, target_emb, delta_emb], dim=1) 
                 
@@ -345,6 +363,7 @@ class GRPOTrainer:
                 top_k=self.args.topk
             )
             
+            # Decode to Text
             gen_texts = []
             for seq in gen_seqs:
                 if (seq == self.eos_id).any():
@@ -353,57 +372,46 @@ class GRPOTrainer:
                 gen_texts.append(self.tok.decode(seq))
 
             egnn_preds, egnn_valid_mask = self.reward_model.predict_batch(gen_texts)
+
+            target_prop_real = target_prop * self.train_std + self.train_mean
             
-            rewards = torch.zeros(current_bs, device=self.device).fill_(-self.args.invalid_penalty)
-            
+            rewards = torch.zeros(current_bs, device=self.device)
             group_smiles_tracker = [set() for _ in range(self.args.batch_conditions)]
             
             valid_count = 0
-            unique_valid_count = 0
             mae_list = []
 
             for i in range(current_bs):
                 group_idx = i // G
                 
                 if not egnn_valid_mask[i]:
+                    rewards[i] = -1.0
                     continue 
                 
                 smi, is_chem_valid = validate(gen_texts[i])
                 if not is_chem_valid or smi is None:
+                    rewards[i] = -0.5
                     continue
                 
                 valid_count += 1
                 
                 if smi in group_smiles_tracker[group_idx]:
-                    rewards[i] = -0.5 
+                    rewards[i] = -0.2
                     continue
                 
                 group_smiles_tracker[group_idx].add(smi)
-                unique_valid_count += 1
 
-                # Accuracy Calculation
                 pred_val = egnn_preds[i]
-                target_val = target_prop[i].squeeze()
+                target_val = target_prop_real[i].squeeze()
                 abs_err = torch.abs(pred_val - target_val).item()
                 mae_list.append(abs_err)
 
-                # Linear Reward Components
-                rel_err = abs_err / (self.train_mad + 1e-6)
+                alpha = 0.5 * self.train_mad
+                r_acc = math.exp( -abs_err / (alpha + 1e-6) )
                 
-                r_acc = max(-1.0, 1.0 - 0.5 * rel_err)
+                r_valid = 0.5 
                 
-                r_valid = 0.1
-                
-                r_bonus = 0.0
-                if rel_err < 0.1: 
-                    r_bonus = 0.5
-
-                if rel_err < 2.0:
-                    r_total = r_acc + r_valid + r_bonus
-                else:
-                    r_total = r_acc + 0.1 * r_valid
-                
-                rewards[i] = r_total * self.args.reward_scale
+                rewards[i] = (r_valid + r_acc) * self.args.reward_scale
 
             # Advantage Normalization
             advantages = torch.zeros_like(rewards)
@@ -411,9 +419,11 @@ class GRPOTrainer:
                 s = g * G
                 e = s + G
                 grp_r = rewards[s:e]
-                std = grp_r.std()
-                if std < 1e-6: std = 1.0
-                advantages[s:e] = (grp_r - grp_r.mean()) / std
+                
+                mean_r = grp_r.mean()
+                std_r = grp_r.std()
+                if std_r < 1e-6: std_r = 1.0
+                advantages[s:e] = (grp_r - mean_r) / std_r
 
             # PPO Update Preparation
             prefix_embeds_det = prefix_embeds.detach()
@@ -425,10 +435,7 @@ class GRPOTrainer:
             with torch.no_grad():
                 ref_seq_emb = self.ref_model.backbone.embedding(full_seqs)
                 ref_inputs = torch.cat([prefix_embeds_det, ref_seq_emb], dim=1)
-                
-                ref_logits = self.ref_model.backbone(inputs_embeds=ref_inputs)
-                ref_logits = self.ref_model.lm_head(ref_logits) 
-                
+                ref_logits = self.ref_model.lm_head(self.ref_model.backbone(inputs_embeds=ref_inputs))
                 gen_logits_ref = ref_logits[:, 3:-1, :] 
                 ref_logprobs = F.log_softmax(gen_logits_ref, dim=-1)
                 ref_token_logprobs = torch.gather(ref_logprobs, -1, targets.unsqueeze(-1)).squeeze(-1)
@@ -438,9 +445,13 @@ class GRPOTrainer:
                 self.opt.zero_grad()
                 
                 with autocast(enabled=True):
+                    # Re-compute Embeddings (Enable Gradients)
                     curr_ref_emb = self.model.module.mol_projector(ref_egnn_vec)
                     curr_tgt_emb = self.model.module.prop_projector(target_prop)
-                    curr_delta = self.model.module.delta_projector(target_prop - ref_prop)
+                    
+                    curr_delta_val = target_prop - ref_prop
+                    curr_delta = self.model.module.delta_projector(curr_delta_val)
+                    
                     curr_prefix = torch.cat([curr_ref_emb, curr_tgt_emb, curr_delta], dim=1)
                     
                     curr_seq_emb = self.model.module.backbone.embedding(full_seqs)
@@ -475,9 +486,8 @@ class GRPOTrainer:
             if self.local_rank == 0:
                 avg_r = rewards.mean().item()
                 valid_rate = valid_count / current_bs
-                unique_rate = unique_valid_count / current_bs
                 avg_mae = np.mean(mae_list) if mae_list else 0.0
-                print(f"Step {step} | R: {avg_r:.4f} | Val: {valid_rate:.1%} | Uniq: {unique_rate:.1%} | MAE: {avg_mae:.4f} | Loss: {loss.item():.4f}")
+                print(f"Step {step} | R: {avg_r:.4f} | Val: {valid_rate:.1%} | MAE: {avg_mae:.4f} | Loss: {loss.item():.4f}")
 
             # Save
             if step % self.args.save_every == 0 and self.local_rank == 0:
@@ -489,61 +499,49 @@ class GRPOTrainer:
         self.model.eval()
         bs = initial_embeds.size(0)
         curr_embeds = initial_embeds
-        
         gen_tokens = []
         finished = torch.zeros(bs, dtype=torch.bool, device=self.device)
-        
         for _ in range(max_len):
             outputs = self.model.module.backbone(inputs_embeds=curr_embeds)
             last_hidden = outputs[:, -1, :]
-            logits = self.model.module.lm_head(last_hidden) # [B, V]
-
+            logits = self.model.module.lm_head(last_hidden) 
             logits = logits / temp
             if top_k > 0:
                 v, _ = torch.topk(logits, top_k)
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            
             probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, 1) # [B, 1]
-            
+            next_token = torch.multinomial(probs, 1) 
             is_eos = (next_token.squeeze(1) == self.eos_id)
             finished = finished | is_eos
-
             next_token = torch.where(finished.unsqueeze(1), torch.tensor(self.pad_id, device=self.device), next_token)
-            
             gen_tokens.append(next_token)
-
             token_emb = self.model.module.backbone.embedding(next_token)
             curr_embeds = torch.cat([curr_embeds, token_emb], dim=1)
-            
-            if finished.all():
-                break
-                
+            if finished.all(): break
         return torch.cat(gen_tokens, dim=1), None
-    
-def run_ddp(rank, world_size, args, train_mean, train_mad):
+
+def run_ddp(rank, world_size, args, train_mean, train_std, train_mad):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     os.environ['RANK'] = str(rank)
     os.environ['LOCAL_RANK'] = str(rank)
     os.environ['WORLD_SIZE'] = str(world_size)
+
+    trainer = GRPOTrainer(args, train_mean, train_std, train_mad)
     
-    trainer = GRPOTrainer(args, train_mean, train_mad)
     trainer.train(total_iters=args.iters)
-    
     dist.destroy_process_group()
-    
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_name", type=str, default="grpo_test")
-    parser.add_argument("--sft_ckpt", type=str, required=True, help="Pretrained Poetic Model Path")
+    parser.add_argument("--sft_ckpt", type=str, required=True)
     parser.add_argument("--vocab_dir", type=str, required=True)
-    parser.add_argument("--root_path", type=str, required=True, help="Data txt path")
-    parser.add_argument("--prop_path", type=str, required=True, help="Prop txt path")
+    parser.add_argument("--finetune_data_path", type=str, required=True, help="Path to .npz from finetune_retriever.py")
+    parser.add_argument("--prop_path", type=str, required=True, help="Original prop txt for stats")
     parser.add_argument("--db_emb_path", type=str, required=True)
     parser.add_argument("--db_prop_path", type=str, required=True)
-    parser.add_argument("--retrieval_path", type=str, required=True)
-    parser.add_argument("--classifier_path", type=str, required=True, help="EGNN Classifier Dir")
+    parser.add_argument("--classifier_path", type=str, required=True)
     
     # Model Args
     parser.add_argument("--n_layer", type=int, default=16)
@@ -554,13 +552,13 @@ if __name__ == "__main__":
     # RL Args
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--batch_conditions", type=int, default=4, help="Number of queries per step")
-    parser.add_argument("--group_size", type=int, default=8, help="Samples per query")
+    parser.add_argument("--batch_conditions", type=int, default=4)
+    parser.add_argument("--group_size", type=int, default=8)
     parser.add_argument("--ppo_epochs", type=int, default=2)
     parser.add_argument("--clip_eps", type=float, default=0.2)
     parser.add_argument("--kl_coeff", type=float, default=0.1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--save_every", type=int, default=50)
+    parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--out_dir", type=str, default="grpo_checkpoints")
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
@@ -569,22 +567,13 @@ if __name__ == "__main__":
     parser.add_argument("--max_len", type=int, default=160)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--topk", type=int, default=80) 
-    
-    # Reward Args
-    parser.add_argument("--invalid_penalty", type=float, default=2.0)
     parser.add_argument("--reward_scale", type=float, default=1.0)
 
     args = parser.parse_args()
-    train_mean, train_mad = get_stats(args.prop_path)
+    train_mean, train_std, train_mad = get_stats(args.prop_path)
 
     world_size = torch.cuda.device_count()
-    
     if world_size > 0:
-        mp.spawn(
-            run_ddp, 
-            args=(world_size, args, train_mean, train_mad), 
-            nprocs=world_size
-        )
+        mp.spawn(run_ddp, args=(world_size, args, train_mean, train_std, train_mad), nprocs=world_size)
     else:
-        print("Warning: No GPU found, running on CPU (RANK 0).")
-        run_ddp(0, 1, args, train_mean, train_mad)
+        run_ddp(0, 1, args, train_mean, train_std, train_mad)
