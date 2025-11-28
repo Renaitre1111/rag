@@ -176,18 +176,19 @@ python -u main_qm9.py --num_workers 2 --lr 5e-4 --property U0 --exp_name exp_1_U
 python -u main_qm9.py --num_workers 2 --lr 5e-4 --property zpve --exp_name exp_1_zpve
 
 
-python main_qm9_prop_schnet.py --property alpha --lr 5e-4 --epochs 500 --nf 128 --n_interactions 6 --exp_name schnet_alpha 
-python main_qm9_prop_schnet.py --property gap --lr 1e-3 --epochs 500 --nf 128 --n_interactions 6 --exp_name schnet_gap 
-python main_qm9_prop_schnet.py --property homo --lr 1e-3 --epochs 500 --nf 128 --n_interactions 6 --exp_name schnet_homo 
-python main_qm9_prop_schnet.py --property lumo --lr 1e-3 --epochs 500 --nf 128 --n_interactions 6 --exp_name schnet_lumo 
-python main_qm9_prop_schnet.py --property mu --lr 5e-4 --epochs 500 --nf 128 --n_interactions 6 --exp_name schnet_mu 
-python main_qm9_prop_schnet.py --property Cv --lr 5e-4 --epochs 500 --nf 128 --n_interactions 6 --exp_name schnet_Cv 
-python main_alchemy_prop.py --data_path alchemy --property alpha --exp_name alchemy_alpha --model_name egnn --batch_size 256
-CUDA_VISIBLE_DEVICES=0 python main_alchemy_prop.py --data_path alchemy --property gap --exp_name alchemy_gap --model_name egnn --batch_size 256
-CUDA_VISIBLE_DEVICES=1 python main_alchemy_prop.py --data_path alchemy --property homo --exp_name alchemy_homo --model_name egnn --batch_size 256
-CUDA_VISIBLE_DEVICES=3 python main_alchemy_prop.py --data_path alchemy --property lumo --exp_name alchemy_lumo --model_name egnn --batch_size 256
-CUDA_VISIBLE_DEVICES=0 python main_alchemy_prop.py --data_path alchemy --property mu --exp_name alchemy_mu --model_name egnn --batch_size 320 --lr 5e-4 --epochs 1000
-CUDA_VISIBLE_DEVICES=0 python main_alchemy_prop.py --data_path alchemy --property Cv --exp_name alchemy_Cv --model_name egnn --batch_size 256 --lr 5e-4 --epochs 1000
+python main_alchemy.py --exp_name alchemy_alpha_egnn --property alpha --model_name egnn --batch_size 256 --lr 5e-4 
+python main_alchemy.py --exp_name alchemy_gap_egnn --property gap --model_name egnn --batch_size 256 --lr 1e-3
+python main_alchemy.py --exp_name alchemy_homo_egnn --property homo --model_name egnn --batch_size 256 --lr 1e-3
+python main_alchemy.py --exp_name alchemy_lumo_egnn --property lumo --model_name egnn --batch_size 256 --lr 1e-3
+python main_alchemy.py --exp_name alchemy_mu_egnn --property mu --model_name egnn --batch_size 256 --lr 5e-4
+python main_alchemy.py --exp_name alchemy_Cv_egnn --property Cv --model_name egnn --batch_size 256 --lr 5e-4
+
+python main_alchemy.py --exp_name alchemy_alpha_schnet --property alpha --model_name schnet --batch_size 256 --lr 5e-4 
+python main_alchemy.py --exp_name alchemy_gap_schnet --property gap --model_name schnet --batch_size 256 --lr 1e-3
+python main_alchemy.py --exp_name alchemy_homo_schnet --property homo --model_name schnet --batch_size 256 --lr 1e-3
+python main_alchemy.py --exp_name alchemy_lumo_schnet --property lumo --model_name schnet --batch_size 256 --lr 1e-3
+python main_alchemy.py --exp_name alchemy_mu_schnet --property mu --model_name schnet --batch_size 256 --lr 5e-4
+python main_alchemy.py --exp_name alchemy_Cv_schnet --property Cv --model_name schnet --batch_size 256 --lr 5e-4
 ```
 
 #### Acknowledgements

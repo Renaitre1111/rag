@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from .models.gcl import unsorted_segment_sum
+from .gcl import unsorted_segment_sum
 
 
 class ShiftedSoftplus(nn.Module):

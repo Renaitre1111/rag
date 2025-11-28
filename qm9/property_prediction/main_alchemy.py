@@ -10,18 +10,11 @@ import pickle
 
 sys.path.append(os.path.abspath(os.path.join('../../')))
 from qm9.property_prediction.models_property import EGNN, Naive, NumNodes
+from qm9.property_prediction.models import SchNet
 from qm9.property_prediction import prop_utils
 
-PROPERTY_MAP = {
-    "alpha": 0,
-    "gap": 1,
-    "homo": 2,
-    "lumo": 3,
-    "mu": 4,
-    "Cv": 5
-}
-
-ALLOWED_CHARGES = [1, 6, 7, 8, 9, 15, 16, 17, 35, 53] 
+PROPERTY_MAP = {"alpha": 0, "gap": 1, "homo": 2, "lumo": 3, "mu": 4, "Cv": 5}
+ALLOWED_CHARGES = [1, 6, 7, 8, 9, 15, 16, 17, 35, 53]
 
 class AlchemyDataset(Dataset):
     def __init__(self, npz_path, property_name):
@@ -36,19 +29,6 @@ class AlchemyDataset(Dataset):
         self.num_atoms = torch.tensor(data['num_atoms'], dtype=torch.long).clone()
         self.props = torch.tensor(data['props'], dtype=torch.float32).clone()
         
-        HARTREE_TO_EV = 27.2114
-        HARTREE_TO_CAL = 627509.474
-        convert_keys = ["gap", "homo", "lumo"]
-        
-        
-        for key in convert_keys:
-            if key in PROPERTY_MAP:
-                col_idx = PROPERTY_MAP[key]
-                self.props[:, col_idx] = self.props[:, col_idx] * HARTREE_TO_EV
-        if "Cv" in PROPERTY_MAP:
-            col_idx = PROPERTY_MAP["Cv"]
-            self.props[:, col_idx] = self.props[:, col_idx] * HARTREE_TO_CAL
-
         if property_name not in PROPERTY_MAP:
             raise ValueError(f"Property {property_name} not found in {list(PROPERTY_MAP.keys())}")
             
@@ -177,6 +157,12 @@ def get_model(args, in_node_nf):
         model = EGNN(in_node_nf=in_node_nf, in_edge_nf=0, hidden_nf=args.nf, device=args.device, 
                      n_layers=args.n_layers, coords_weight=1.0,
                      attention=args.attention, node_attr=args.node_attr)
+    elif args.model_name == 'schnet':
+        model = SchNet(in_node_nf=in_node_nf, hidden_nf=args.nf, device=args.device,
+                       n_interactions=args.n_interactions, 
+                       n_gaussians=args.n_gaussians, 
+                       cutoff=args.cutoff,
+                       act_fn=nn.SiLU())
     elif args.model_name == 'naive':
         model = Naive(device=args.device)
     elif args.model_name == 'numnodes':
@@ -201,6 +187,10 @@ if __name__ == "__main__":
     parser.add_argument('--n_layers', type=int, default=7)
     parser.add_argument('--attention', type=int, default=1)
     parser.add_argument('--node_attr', type=int, default=0)
+    # SchNet
+    parser.add_argument('--n_interactions', type=int, default=6, help='number of interaction blocks for SchNet')
+    parser.add_argument('--n_gaussians', type=int, default=50, help='number of gaussians for SchNet distance expansion')
+    parser.add_argument('--cutoff', type=float, default=10.0, help='cutoff radius for SchNet')
     
     parser.add_argument('--no-cuda', action='store_true', default=False)
     parser.add_argument('--seed', type=int, default=1)

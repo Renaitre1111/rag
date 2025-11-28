@@ -17,6 +17,13 @@ df = df.rename(columns={
     "mu\n(D, dipole moment)": "mu",
     "Cv\n(cal/molK, heat capacity at 298.15 K)": "Cv",
 })
+
+energy_cols = ["gap", "homo", "lumo"]
+for col in energy_cols:
+    df[col] = df[col] * 27.2114
+
+df["Cv"] = df["Cv"] * 627509.47
+
 target_cols = ["alpha", "gap", "homo", "lumo", "mu", "Cv"]
 df["gdb_idx"] = df["gdb_idx"].astype(int)
 df = df[["gdb_idx"] + target_cols]
