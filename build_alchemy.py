@@ -101,12 +101,15 @@ np.random.seed(42)
 perm = np.random.permutation(num_mol)
 
 n_valid = int(num_mol * 0.1)
-valid_idx = perm[:n_valid]
+n_test = int(num_mol * 0.1)
 
-train_all_idx = perm[n_valid:]
+valid_idx = perm[:n_valid]
+test_idx = perm[n_valid : n_valid + n_test]
+
+train_all_idx = perm[n_valid + n_test :]
 n_train_all = len(train_all_idx)
-n_train_gen = n_train_all // 2
-n_train_eval = n_train_all - n_train_gen 
+
+n_train_gen = n_train_all // 2 
 
 train_gen_idx = train_all_idx[:n_train_gen]
 train_eval_idx = train_all_idx[n_train_gen:]
@@ -115,6 +118,8 @@ print(f"Total: {num_mol}")
 print(f"  train_gen: {len(train_gen_idx)}")
 print(f"  train_eval: {len(train_eval_idx)}")
 print(f"  valid: {len(valid_idx)}")
+print(f"  test: {len(test_idx)}")
+
 
 def save_split(name, idx):
     np.savez_compressed(
@@ -131,6 +136,7 @@ def save_split(name, idx):
     
     print(f"Saved: alchemy_{name}.npz AND {smiles_filename}")
 
+save_split("valid", valid_idx)
+save_split("test", test_idx)
 save_split("train_gen", train_gen_idx)
 save_split("train_eval", train_eval_idx)
-save_split("valid", valid_idx)
