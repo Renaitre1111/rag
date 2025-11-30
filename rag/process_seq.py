@@ -1,8 +1,11 @@
+import sys, os
+current_path = os.path.dirname(os.path.abspath(__file__))
+root_path = os.path.dirname(current_path)
+sys.path.append(root_path)
 import torch
 import numpy as np
 import pickle
 import os
-import sys
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 from qm9.property_prediction.models_property import EGNN, Naive, NumNodes
@@ -32,7 +35,15 @@ def get_classifier(dir_path, atom_types, device='cpu'):
     else:
         raise ValueError(f"Unknown model: {args_classifier.model_name}")
 
-    ckpt_path = join(dir_path, 'best_checkpoint.pth')
+    path_pth = join(dir_path, 'best_checkpoint.pth')
+    path_npy = join(dir_path, 'best_checkpoint.npy')
+    
+    if os.path.exists(path_pth):
+        ckpt_path = path_pth
+    elif os.path.exists(path_npy):
+        ckpt_path = path_npy
+    else:
+        raise FileNotFoundError(f"No checkpoint found in {dir_path}. Checked for best_checkpoint.pth and .npy")
     
     print(f"Loading weights from {ckpt_path}")
     classifier_state_dict = torch.load(ckpt_path, map_location=device)
@@ -170,6 +181,9 @@ def main():
     if args.dataset == 'alchemy':
         atom_map = {'H': 0, 'C': 1, 'N': 2, 'O': 3, 'F': 4, 'P': 5, 'S': 6, 'Cl': 7, 'Br': 8, 'I': 9}
         atom_types = 10
+    elif args.dataset == 'qm9':
+        atom_map = {'H': 0, 'C': 1, 'N': 2, 'O': 3, 'F': 4}
+        atom_types = 5
 
     classifier = get_classifier(args.classifier_path, atom_types, args.device)
 

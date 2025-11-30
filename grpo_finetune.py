@@ -28,7 +28,7 @@ ALCHEMY_ATOM_MAP = {
     'H': 0, 'C': 1, 'N': 2, 'O': 3, 'F': 4, 
     'P': 5, 'S': 6, 'Cl': 7, 'Br': 8, 'I': 9, 
 }
-NUM_ATOM_TYPES = 10
+QM9_ATOM_MAP = {'H': 0, 'C': 1, 'N': 2, 'O': 3, 'F': 4}
 
 def set_seed(seed):
     random.seed(seed)
@@ -36,7 +36,11 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def validate(line: str):
+def validate(line: str, dataset: str):
+    if dataset == 'qm9':
+        atom_map = QM9_ATOM_MAP
+    else:
+        atom_map = ALCHEMY_ATOM_MAP
     try:
         toks = line.split()
         if len(toks) % 4 != 0 or len(toks) == 0:
@@ -45,7 +49,7 @@ def validate(line: str):
         mol_data = np.array(toks).reshape(-1, 4)
         symbols = mol_data[:, 0]
 
-        if any(s not in ALCHEMY_ATOM_MAP for s in symbols):
+        if any(s not in atom_map for s in symbols):
             return None, False
 
         d = mol_data[:, 1].astype(float)
@@ -131,10 +135,15 @@ class GRPODataset(Dataset):
         return ref_vec, ref_prop, target_val
 
 class RewardModel:
-    def __init__(self, classifier_path, device, train_mean, train_mad, max_num_atoms=40):
+    def __init__(self, classifier_path, device, train_mean, train_mad, dataset, max_num_atoms=40):
         self.device = device
         self.maxN = max_num_atoms
-        self.elem2idx = ALCHEMY_ATOM_MAP
+        if dataset == 'qm9':
+            self.elem2idx = QM9_ATOM_MAP
+            self.num_atom_types = 5
+        else:
+            self.elem2idx = ALCHEMY_ATOM_MAP
+            self.num_atom_types = 10
         
         self.mean = torch.tensor(train_mean, device=device)
         self.mad = torch.tensor(train_mad, device=device)
@@ -154,7 +163,7 @@ class RewardModel:
         print(f"Loading classifier config from {dir_path}...")
         
         if args_classifier.model_name == 'egnn':
-            classifier = EGNN(in_node_nf=NUM_ATOM_TYPES, in_edge_nf=0, 
+            classifier = EGNN(in_node_nf=self.num_atom_types, in_edge_nf=0, 
                               hidden_nf=args_classifier.nf, device=device, 
                               n_layers=args_classifier.n_layers, coords_weight=1.0,
                               attention=args_classifier.attention, node_attr=args_classifier.node_attr)
@@ -183,7 +192,7 @@ class RewardModel:
             
             seq = mol[:, 0]
             idxs = [self.elem2idx[str(s)] for s in seq]
-            one_hot = torch.nn.functional.one_hot(torch.tensor(idxs), num_classes=NUM_ATOM_TYPES).float()
+            one_hot = torch.nn.functional.one_hot(torch.tensor(idxs), num_classes=self.num_atom_types).float()
             
             d = mol[:, 1].astype(float)
             theta = [str(x).replace('°','') for x in mol[:, 2]]
@@ -198,7 +207,7 @@ class RewardModel:
             N = one_hot.shape[0]
             if N > self.maxN: return None
 
-            oh_out = torch.zeros((self.maxN, NUM_ATOM_TYPES), dtype=torch.float32)
+            oh_out = torch.zeros((self.maxN, self.num_atom_types), dtype=torch.float32)
             pos_out = torch.zeros((self.maxN, 3), dtype=torch.float32)
             msk_out = torch.zeros((self.maxN,), dtype=torch.float32)
 
@@ -292,7 +301,8 @@ class GRPOTrainer:
             classifier_path=args.classifier_path,
             device=self.device,
             train_mean=train_mean,
-            train_mad=train_mad
+            train_mad=train_mad,
+            dataset=args.dataset
         )
 
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -388,7 +398,7 @@ class GRPOTrainer:
                     rewards[i] = -1.0
                     continue 
                 
-                smi, is_chem_valid = validate(gen_texts[i])
+                smi, is_chem_valid = validate(gen_texts[i], dataset=self.args.dataset)
                 if not is_chem_valid or smi is None:
                     rewards[i] = -0.5
                     continue
@@ -535,6 +545,7 @@ def run_ddp(rank, world_size, args, train_mean, train_std, train_mad):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_name", type=str, default="grpo_test")
+    parser.add_argument("--dataset", type=str, default="alchemy", choices=["alchemy", "qm9"])
     parser.add_argument("--sft_ckpt", type=str, required=True)
     parser.add_argument("--vocab_dir", type=str, required=True)
     parser.add_argument("--finetune_data_path", type=str, required=True, help="Path to .npz from finetune_retriever.py")

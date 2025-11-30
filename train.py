@@ -123,7 +123,11 @@ def run(args, rank=None):
         model.load_state_dict(checkpoint['model_state_dict'], strict=True)
         
     print('total params:', sum(p.numel() for p in model.parameters()))
-    os.makedirs(f'cond/{args.prop}_weights/', exist_ok=True)
+
+    if rank is None or rank == 0:
+        save_dir = os.path.dirname(args.save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
     
     tconf = TrainerConfig(
         max_epochs=args.max_epochs, 
@@ -133,7 +137,7 @@ def run(args, rank=None):
         warmup_tokens=0.1 * len(train_dataset) * max_len,
         final_tokens=args.max_epochs * len(train_dataset) * max_len,
         num_workers=args.num_workers, 
-        ckpt_path=f'cond/{args.prop}_weights/{args.run_name}.pt',
+        ckpt_path=args.save_path,
         run_name=args.run_name, 
         block_size=max_len, 
         generate=False, 
@@ -180,6 +184,7 @@ if __name__ == '__main__':
     parser.add_argument('--root_path', help="Path to the root data directory", required=True)
     parser.add_argument('--prop_path', help="Path to target properties (.txt)", required=True)
     parser.add_argument('--tokenizer_dir', help="Path to the saved tokenizer directory", required=True)
+    parser.add_argument('--save_path', help="Path to save the model checkpoint", required=True)
     parser.add_argument('--dist', action='store_true', default=False, help='use torch.distributed')
 
     parser.add_argument('--db_emb_path', help="Path to DB EGNN embeddings (.npz)", required=True)
