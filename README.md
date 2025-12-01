@@ -48,6 +48,15 @@ python rag/finetune_retriever.py --db_emb_path data/qm9_Cv/qm9_Cv_embeddings.npz
 ```
 
 ```bash
+python sample.py --prop_path data/qm9_alpha/alpha.txt --save_path data/qm9_alpha/sampled_alpha.txt --num_samples 10000 --num_bins 1000 --seed 3407
+python sample.py --prop_path data/qm9_gap/gap.txt --save_path data/qm9_gap/sampled_gap.txt --num_samples 10000 --num_bins 1000 --seed 3407
+python sample.py --prop_path data/qm9_homo/homo.txt --save_path data/qm9_homo/sampled_homo.txt --num_samples 10000 --num_bins 1000 --seed 3407
+python sample.py --prop_path data/qm9_lumo/lumo.txt --save_path data/qm9_lumo/sampled_lumo.txt --num_samples 10000 --num_bins 1000 --seed 3407
+python sample.py --prop_path data/qm9_mu/mu.txt --save_path data/qm9_mu/sampled_mu.txt --num_samples 10000 --num_bins 1000 --seed 3407
+python sample.py --prop_path data/qm9_Cv/Cv.txt --save_path data/qm9_Cv/sampled_Cv.txt --num_samples 10000 --num_bins 1000 --seed 3407
+```
+
+```bash
 python rag/test_retriever.py --db_emb_path data/qm9_alpha/qm9_alpha_embeddings.npz --db_prop_path data/qm9_alpha/alpha.txt --query_prop_path data/qm9_alpha/sampled_alpha.txt --save_path data/qm9_alpha/test_ret_alpha.npz --k_pool 100 --k_fine 10
 python rag/test_retriever.py --db_emb_path data/qm9_gap/qm9_gap_embeddings.npz --db_prop_path data/qm9_gap/gap.txt --query_prop_path data/qm9_gap/sampled_gap.txt --save_path data/qm9_gap/test_ret_gap.npz --k_pool 100 --k_fine 10
 python rag/test_retriever.py --db_emb_path data/qm9_homo/qm9_homo_embeddings.npz --db_prop_path data/qm9_homo/homo.txt --query_prop_path data/qm9_homo/sampled_homo.txt --save_path data/qm9_homo/test_ret_homo.npz --k_pool 100 --k_fine 10
@@ -63,15 +72,6 @@ python train.py --run_name conditional_qm9 --prop homo --model poetic --root_pat
 python train.py --run_name conditional_qm9 --prop lumo --model poetic --root_path ./data/qm9_seq.txt --prop_path ./data/qm9_lumo/lumo.txt --db_emb_path ./data/qm9_lumo/qm9_lumo_embeddings.npz --db_prop_path ./data/qm9_lumo/lumo.txt --retrieval_path data/qm9_lumo/train_ret_lumo.npz --tokenizer_dir ./data/qm9_tokenizer/lumo --batch_size 160 --learning_rate 6e-4 --max_epochs 200 --num_workers 8 --max_len 128 --save_path cond/qm9/lumo_weights/conditional_qm9.pt
 python train.py --run_name conditional_qm9 --prop mu --model poetic --root_path ./data/qm9_seq.txt --prop_path ./data/qm9_mu/mu.txt --db_emb_path ./data/qm9_mu/qm9_mu_embeddings.npz --db_prop_path ./data/qm9_mu/mu.txt --retrieval_path data/qm9_mu/train_ret_mu.npz --tokenizer_dir ./data/qm9_tokenizer/mu --batch_size 160 --learning_rate 6e-4 --max_epochs 200 --num_workers 8 --max_len 128 --save_path cond/qm9/mu_weights/conditional_qm9.pt
 python train.py --run_name conditional_qm9 --prop Cv --model poetic --root_path ./data/qm9_seq.txt --prop_path ./data/qm9_Cv/Cv.txt --db_emb_path ./data/qm9_Cv/qm9_Cv_embeddings.npz --db_prop_path ./data/qm9_Cv/Cv.txt --retrieval_path data/qm9_Cv/train_ret_Cv.npz --tokenizer_dir ./data/qm9_tokenizer/Cv --batch_size 160 --learning_rate 6e-4 --max_epochs 200 --num_workers 8 --max_len 128 --save_path cond/qm9/Cv_weights/conditional_qm9.pt
-```
-
-```bash
-python sample.py --prop_path data/qm9_alpha/alpha.txt --save_path data/qm9_alpha/sampled_alpha.txt --num_samples 10000 --num_bins 1000 --seed 3407
-python sample.py --prop_path data/qm9_gap/gap.txt --save_path data/qm9_gap/sampled_gap.txt --num_samples 10000 --num_bins 1000 --seed 3407
-python sample.py --prop_path data/qm9_homo/homo.txt --save_path data/qm9_homo/sampled_homo.txt --num_samples 10000 --num_bins 1000 --seed 3407
-python sample.py --prop_path data/qm9_lumo/lumo.txt --save_path data/qm9_lumo/sampled_lumo.txt --num_samples 10000 --num_bins 1000 --seed 3407
-python sample.py --prop_path data/qm9_mu/mu.txt --save_path data/qm9_mu/sampled_mu.txt --num_samples 10000 --num_bins 1000 --seed 3407
-python sample.py --prop_path data/qm9_Cv/Cv.txt --save_path data/qm9_Cv/sampled_Cv.txt --num_samples 10000 --num_bins 1000 --seed 3407
 ```
 
 ```bash
