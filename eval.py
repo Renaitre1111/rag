@@ -15,9 +15,9 @@ ALCHEMY_ATOM_MAP = {
     'H': 0, 'C': 1, 'N': 2, 'O': 3, 'F': 4,
     'P': 5, 'S': 6, 'Cl': 7, 'Br': 8, 'I': 9,
 }
-NUM_ATOM_TYPES = 10
+QM9_ATOM_MAP = {'H': 0, 'C': 1, 'N': 2, 'O': 3, 'F': 4}
 
-def get_classifier(dir_path='', device='cpu'):
+def get_classifier(dir_path='', atom_types=10, device='cpu'):
     args_path = join(dir_path, 'args.pickle')
     if not os.path.exists(args_path):
         raise FileNotFoundError(f"Classifier args not found at {args_path}")
@@ -29,7 +29,7 @@ def get_classifier(dir_path='', device='cpu'):
     print(f"Loading classifier from {dir_path}...")
     
     if args_classifier.model_name == 'egnn':
-        classifier = EGNN(in_node_nf=NUM_ATOM_TYPES, in_edge_nf=0, 
+        classifier = EGNN(in_node_nf=atom_types, in_edge_nf=0, 
                           hidden_nf=args_classifier.nf, device=device, 
                           n_layers=args_classifier.n_layers, coords_weight=1.0,
                           attention=args_classifier.attention, node_attr=args_classifier.node_attr)
@@ -61,7 +61,14 @@ def get_stats(prop_path):
     return mean, mad
 
 
-def parse_gen_data(gen_path, target_path, max_num_atoms=100):
+def parse_gen_data(gen_path, target_path, dataset='alchemy', max_num_atoms=100):
+    if dataset == 'qm9':
+        atom_map = QM9_ATOM_MAP
+        num_atom_types = 5
+    else:
+        atom_map = ALCHEMY_ATOM_MAP
+        num_atom_types = 10
+    
     with open(gen_path, 'r') as f:
         gen_lines = [line.strip() for line in f.readlines()]
     with open(target_path, 'r') as f:
@@ -69,7 +76,7 @@ def parse_gen_data(gen_path, target_path, max_num_atoms=100):
 
     num_samples = len(gen_lines)
 
-    one_hot = torch.zeros((num_samples, max_num_atoms, NUM_ATOM_TYPES), dtype=torch.float32)
+    one_hot = torch.zeros((num_samples, max_num_atoms, num_atom_types), dtype=torch.float32)
     x = torch.zeros((num_samples, max_num_atoms, 3), dtype=torch.float32)
     node_mask = torch.zeros((num_samples, max_num_atoms), dtype=torch.float32)
     y = torch.zeros((num_samples), dtype=torch.float32)
@@ -91,8 +98,8 @@ def parse_gen_data(gen_path, target_path, max_num_atoms=100):
         seq = mol_data[:, 0]
         
         try:
-            atom_indices = [ALCHEMY_ATOM_MAP[a] for a in seq]
-            one_hot_emb = torch.nn.functional.one_hot(torch.tensor(atom_indices), NUM_ATOM_TYPES)
+            atom_indices = [atom_map[a] for a in seq]
+            one_hot_emb = torch.nn.functional.one_hot(torch.tensor(atom_indices), num_atom_types)
         except Exception:
             stats['seq_err'] += 1
             continue
@@ -134,8 +141,8 @@ def parse_gen_data(gen_path, target_path, max_num_atoms=100):
     return molecules
 
 class CondMol(Dataset):
-    def __init__(self, gen_path, target_path, max_num_atoms=40):
-        self.data = parse_gen_data(gen_path, target_path, max_num_atoms=max_num_atoms)
+    def __init__(self, gen_path, target_path, dataset='alchemy', max_num_atoms=40):
+        self.data = parse_gen_data(gen_path, target_path, dataset=dataset, max_num_atoms=max_num_atoms)
 
     def __len__(self):
         return len(self.data['y'])
@@ -223,7 +230,11 @@ def eval(model, loader, mean, mad, device, log_interval=20):
     return res['loss'] / res['counter']
 
 def main_quantitative(args):
-    classifier = get_classifier(args.classifier_path, args.device)
+    if args.dataset == 'qm9':
+        atom_types = 5
+    else:
+        atom_types = 10
+    classifier = get_classifier(args.classifier_path, atom_types, args.device)
 
     mean, mad = get_stats(args.train_prop_path)
     mean = mean.to(args.device)
@@ -232,6 +243,7 @@ def main_quantitative(args):
     dataset = CondMol(
         gen_path=args.generated_path, 
         target_path=args.target_path, 
+        dataset=args.dataset,
         max_num_atoms=args.max_num_atoms
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
@@ -247,6 +259,7 @@ if __name__ == "__main__":
     parser.add_argument('--generated_path', type=str, required=True, help="Path to generated molecules (.txt)")
     parser.add_argument('--target_path', type=str, required=True, help="Path to target properties (.txt)")
     parser.add_argument('--classifier_path', type=str, required=True, help="Path to trained EGNN classifier")
+    parser.add_argument('--dataset', type=str, default='alchemy', choices=['alchemy', 'qm9'])
     
     parser.add_argument('--property', type=str, default='gap')
     parser.add_argument('--train_prop_path', type=str, required=True, help="Path to training properties (.txt)")

@@ -14,11 +14,16 @@ from qm9.property_prediction.models import SchNet
 from qm9.property_prediction import prop_utils
 
 PROPERTY_MAP = {"alpha": 0, "gap": 1, "homo": 2, "lumo": 3, "mu": 4, "Cv": 5}
-ALLOWED_CHARGES = [1, 6, 7, 8, 9, 15, 16, 17, 35, 53]
+ALLOWED_CHARGES_ALCHEMY = [1, 6, 7, 8, 9, 15, 16, 17, 35, 53]
+ALLOWED_CHARGES_QM9 = [1, 6, 7, 8, 9]
 
 class AlchemyDataset(Dataset):
-    def __init__(self, npz_path, property_name):
+    def __init__(self, npz_path, property_name, dataset='alchemy'):
         super().__init__()
+        if dataset == 'qm9':
+            self.allowed_charges = ALLOWED_CHARGES_QM9
+        else:
+            self.allowed_charges = ALLOWED_CHARGES_ALCHEMY
         
         if not os.path.exists(npz_path):
             raise FileNotFoundError(f"Data file not found: {npz_path}")
@@ -33,8 +38,8 @@ class AlchemyDataset(Dataset):
             raise ValueError(f"Property {property_name} not found in {list(PROPERTY_MAP.keys())}")
             
         self.prop_idx = PROPERTY_MAP[property_name]
-        self.charge_to_idx = {z: i for i, z in enumerate(ALLOWED_CHARGES)}
-        self.num_atom_types = len(ALLOWED_CHARGES)
+        self.charge_to_idx = {z: i for i, z in enumerate(self.allowed_charges)}
+        self.num_atom_types = len(self.allowed_charges)
 
     def __len__(self):
         return len(self.props)
@@ -176,6 +181,7 @@ if __name__ == "__main__":
     parser.add_argument('--exp_name', type=str, default='alchemy_run')
     parser.add_argument('--data_path', type=str, default='alchemy')
     parser.add_argument('--property', type=str, default='gap', choices=list(PROPERTY_MAP.keys()))
+    parser.add_argument('--dataset', type=str, default='alchemy', choices=['alchemy', 'qm9'])
     
     parser.add_argument('--batch_size', type=int, default=96)
     parser.add_argument('--epochs', type=int, default=1000)
