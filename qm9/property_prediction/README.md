@@ -183,12 +183,12 @@ python main_prop.py --exp_name alchemy_lumo_egnn --property lumo --model_name eg
 python main_prop.py --exp_name alchemy_mu_egnn --property mu --model_name egnn --batch_size 256 --lr 5e-4
 python main_prop.py --exp_name alchemy_Cv_egnn --property Cv --model_name egnn --batch_size 256 --lr 5e-4
 
-python main_prop.py --exp_name alchemy_alpha_schnet --property alpha --model_name schnet --batch_size 256 --lr 5e-4 
-python main_prop.py --exp_name alchemy_gap_schnet --property gap --model_name schnet --batch_size 256 --lr 1e-3
-python main_prop.py --exp_name alchemy_homo_schnet --property homo --model_name schnet --batch_size 256 --lr 1e-3
-python main_prop.py --exp_name alchemy_lumo_schnet --property lumo --model_name schnet --batch_size 256 --lr 1e-3
-python main_prop.py --exp_name alchemy_mu_schnet --property mu --model_name schnet --batch_size 256 --lr 5e-4
-python main_prop.py --exp_name alchemy_Cv_schnet --property Cv --model_name schnet --batch_size 256 --lr 5e-4
+python main_prop.py --exp_name alchemy_alpha_schnet --property alpha --model_name schnet --batch_size 256 --lr 5e-4 --epochs 500
+python main_prop.py --exp_name alchemy_gap_schnet --property gap --model_name schnet --batch_size 256 --lr 1e-3 --epochs 500
+python main_prop.py --exp_name alchemy_homo_schnet --property homo --model_name schnet --batch_size 256 --lr 1e-3 --epochs 500
+python main_prop.py --exp_name alchemy_lumo_schnet --property lumo --model_name schnet --batch_size 256 --lr 1e-3 --epochs 500
+python main_prop.py --exp_name alchemy_mu_schnet --property mu --model_name schnet --batch_size 256 --lr 5e-4 --epochs 500
+python main_prop.py --exp_name alchemy_Cv_schnet --property Cv --model_name schnet --batch_size 256 --lr 5e-4 --epochs 500
 ```
 
 #### Acknowledgements
