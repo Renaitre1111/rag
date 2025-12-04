@@ -52,7 +52,7 @@ class SoftRAGDataset(Dataset):
 
         indices = self.retrieved_indices[idx] # [K]
 
-        if self.split == 'train' and self.retrieved_sims is not None:
+        if self.retrieved_sims is not None:
             sims = self.retrieved_sims[idx] # [K]
             temperature = 0.5 
             probs = F.softmax(sims / temperature, dim=0)

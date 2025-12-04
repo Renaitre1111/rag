@@ -124,7 +124,6 @@ def eval(data, dataset_info, train_smiles_ref, test_smiles_ref=None):
     print(f"Atom Stability: {stability_res['atom_stable']:.4f}")
     print(f"Mol Stability:  {stability_res['mol_stable']:.4f}")
 
-    # 2. 计算 Unique 和 Novelty
     metric_2d_fn = get_2D_edm_metric(dataset_info, train_smiles_ref)
     _, rdkit_res_2d, complete_rdmols = metric_2d_fn(data)
     
@@ -132,7 +131,6 @@ def eval(data, dataset_info, train_smiles_ref, test_smiles_ref=None):
     print(f"Unique (of Valid): {rdkit_res_2d['Unique']:.4f}")
     print(f"Novelty (of Unique): {rdkit_res_2d['Novelty']:.4f}")
 
-    # 3. 计算 MOSES 指标
     if len(complete_rdmols) > 0:
         ref_smiles = test_smiles_ref if test_smiles_ref is not None else train_smiles_ref
         mose_metric = get_moses_metrics(ref_smiles, n_jobs=16, device='cpu')

@@ -94,7 +94,7 @@ class FinetuneRetriever(MoleculeRetriever):
             save_path, 
             targets=targets_np,     # [N, 1] 
             indices=final_indices,  # [N, k]
-            scores=final_scores
+            sims=final_scores
         )
 
 if __name__ == '__main__':
