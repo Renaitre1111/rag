@@ -16,6 +16,8 @@ from tqdm import tqdm
 
 from rdkit import Chem
 from rdkit import RDLogger
+from rdkit import DataStructs
+from rdkit.Chem import AllChem
 RDLogger.DisableLog('rdApp.*')
 
 from dataset import SimpleTokenizer
@@ -305,6 +307,9 @@ class GRPOTrainer:
             dataset=args.dataset
         )
 
+        train_smiles_arr = np.load(args.train_smiles_path, allow_pickle=True)
+        self.train_smiles_set = set(train_smiles_arr)
+
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         self.scaler = GradScaler(enabled=True)
 
@@ -389,6 +394,7 @@ class GRPOTrainer:
             group_smiles_tracker = [set() for _ in range(self.args.batch_conditions)]
             
             valid_count = 0
+            novel_count = 0
             mae_list = []
 
             for i in range(current_bs):
@@ -407,9 +413,16 @@ class GRPOTrainer:
                 
                 if smi in group_smiles_tracker[group_idx]:
                     rewards[i] = -0.2
-                    continue
-                
+                    continue    
                 group_smiles_tracker[group_idx].add(smi)
+
+                is_novel = smi not in self.train_smiles_set
+
+                if is_novel:
+                    novel_count += 1
+                    r_novel = 1.0 
+                else:
+                    r_novel = -0.5
 
                 pred_val = egnn_preds[i]
                 target_val = target_prop_real[i].squeeze()
@@ -419,9 +432,9 @@ class GRPOTrainer:
                 alpha = 0.5 * self.train_mad
                 r_acc = math.exp( -abs_err / (alpha + 1e-6) )
                 
-                r_valid = 0.5 
+                r_valid_base = 0.5
                 
-                rewards[i] = (r_valid + r_acc) * self.args.reward_scale
+                rewards[i] = (r_valid_base + r_acc + r_novel * self.args.novelty_weight) * self.args.reward_scale
 
             # Advantage Normalization
             advantages = torch.zeros_like(rewards)
@@ -496,8 +509,9 @@ class GRPOTrainer:
             if self.local_rank == 0:
                 avg_r = rewards.mean().item()
                 valid_rate = valid_count / current_bs
+                novel_rate = novel_count / valid_count if valid_count > 0 else 0.0
                 avg_mae = np.mean(mae_list) if mae_list else 0.0
-                print(f"Step {step} | R: {avg_r:.4f} | Val: {valid_rate:.1%} | MAE: {avg_mae:.4f} | Loss: {loss.item():.4f}")
+                print(f"Step {step} | R: {avg_r:.4f} | Val: {valid_rate:.1%} | Nov: {novel_rate:.1%} | MAE: {avg_mae:.4f} | Loss: {loss.item():.4f}")
 
             # Save
             if step % self.args.save_every == 0 and self.local_rank == 0:
@@ -549,6 +563,8 @@ if __name__ == "__main__":
     parser.add_argument("--sft_ckpt", type=str, required=True)
     parser.add_argument("--vocab_dir", type=str, required=True)
     parser.add_argument("--finetune_data_path", type=str, required=True, help="Path to .npz from finetune_retriever.py")
+    parser.add_argument("--train_smiles_path", type=str, required=True, help="Path to .npy file containing all training SMILES")
+    parser.add_argument("--novelty_weight", type=float, default=1.0, help="Weight for the novelty reward term")
     parser.add_argument("--prop_path", type=str, required=True, help="Original prop txt for stats")
     parser.add_argument("--db_emb_path", type=str, required=True)
     parser.add_argument("--db_prop_path", type=str, required=True)
