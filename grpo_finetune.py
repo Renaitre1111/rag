@@ -13,6 +13,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+from multiprocessing import Pool
 
 from rdkit import Chem
 from rdkit import RDLogger
@@ -388,6 +389,10 @@ class GRPOTrainer:
 
             egnn_preds, egnn_valid_mask = self.reward_model.predict_batch(gen_texts)
 
+            validate_args = [(text, self.args.dataset) for text in gen_texts]
+            with Pool(processes=8) as pool:
+                validation_results = pool.starmap(validate, validate_args)
+
             target_prop_real = target_prop * self.train_std + self.train_mean
             
             rewards = torch.zeros(current_bs, device=self.device)
@@ -404,7 +409,7 @@ class GRPOTrainer:
                     rewards[i] = -1.0
                     continue 
                 
-                smi, is_chem_valid = validate(gen_texts[i], dataset=self.args.dataset)
+                smi, is_chem_valid = validation_results[i]
                 if not is_chem_valid or smi is None:
                     rewards[i] = -0.5
                     continue

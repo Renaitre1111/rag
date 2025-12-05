@@ -10,6 +10,7 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join('../../')))
 from qm9.property_prediction.models_property import EGNN, Naive, NumNodes
+from qm9.property_prediction.models import SchNet
 
 ALCHEMY_ATOM_MAP = {
     'H': 0, 'C': 1, 'N': 2, 'O': 3, 'F': 4,
@@ -33,6 +34,16 @@ def get_classifier(dir_path='', atom_types=10, device='cpu'):
                           hidden_nf=args_classifier.nf, device=device, 
                           n_layers=args_classifier.n_layers, coords_weight=1.0,
                           attention=args_classifier.attention, node_attr=args_classifier.node_attr)
+    elif args_classifier.model_name == 'schnet':
+        classifier = SchNet(
+            in_node_nf=atom_types, 
+            hidden_nf=args_classifier.nf, 
+            n_interactions=args_classifier.n_interactions,  
+            n_gaussians=args_classifier.n_gaussians,       
+            cutoff=args_classifier.cutoff,
+            device=device,
+            act_fn=nn.SiLU() 
+        )
     elif args_classifier.model_name == 'naive':
         classifier = Naive(device=device)
     elif args_classifier.model_name == 'numnodes':
