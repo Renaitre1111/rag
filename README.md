@@ -180,4 +180,7 @@ python eval.py --generated_path cond/alchemy/homo_gens/homo_generated.txt --targ
 python eval.py --generated_path cond/alchemy/lumo_gens/lumo_generated.txt --target_path data/alchemy_lumo/sampled_lumo.txt --classifier_path qm9/property_prediction/outputs/alchemy_lumo_schnet --property lumo --train_prop_path data/alchemy_lumo/lumo.txt --dataset alchemy
 python eval.py --generated_path cond/alchemy/mu_gens/mu_generated.txt --target_path data/alchemy_mu/sampled_mu.txt --classifier_path qm9/property_prediction/outputs/alchemy_mu_schnet --property mu --train_prop_path data/alchemy_mu/mu.txt --dataset alchemy
 python eval.py --generated_path cond/alchemy/Cv_gens/Cv_generated.txt --target_path data/alchemy_Cv/sampled_Cv.txt --classifier_path qm9/property_prediction/outputs/alchemy_Cv_schnet --property Cv --train_prop_path data/alchemy_Cv/Cv.txt --dataset alchemy
+
+
+
 ```
